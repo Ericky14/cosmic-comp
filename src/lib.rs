@@ -156,6 +156,38 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
     // init backend
     backend::init_backend_auto(&display, &mut event_loop, &mut state)?;
 
+    // Setup video wallpaper frame timer if video is active
+    #[cfg(feature = "video-wallpaper")]
+    if state.common.video_background.is_some() {
+        use std::time::Duration;
+        // Timer to poll video frames - match video framerate (30fps = 33ms)
+        // Polling faster wastes CPU, polling slower misses frames
+        let video_timer = Timer::from_duration(Duration::from_millis(32));
+        if let Err(e) = event_loop.handle().insert_source(video_timer, |_, _, state| {
+            // Poll video frames
+            let has_new_frame = if let Some(ref mut video_manager) = state.common.video_background {
+                video_manager.poll_frames()
+            } else {
+                false
+            };
+
+            // Schedule render for all outputs if we have a new frame
+            if has_new_frame {
+                let outputs: Vec<_> = state.common.shell.read().outputs().cloned().collect();
+                for output in outputs {
+                    state.backend.schedule_render(&output);
+                }
+            }
+
+            // Keep the timer running at video framerate (~30fps)
+            TimeoutAction::ToDuration(Duration::from_millis(32))
+        }) {
+            warn!(?e, "Failed to setup video frame timer");
+        } else {
+            info!("Video wallpaper frame timer started");
+        }
+    }
+
     if let Err(err) = theme::watch_theme(event_loop.handle()) {
         warn!(?err, "Failed to watch theme");
     }
@@ -181,9 +213,15 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
 
         refresh(state);
 
+        // Note: Video frame polling is done via a dedicated timer (32ms interval)
+        // to match video framerate. We don't poll here to avoid wasting CPU
+        // on the main event loop which runs at display refresh rate (165Hz).
+
         {
             let shell = state.common.shell.read();
-            if shell.animations_going() {
+            let schedule_render = shell.animations_going();
+            
+            if schedule_render {
                 for output in shell.outputs().cloned().collect::<Vec<_>>().into_iter() {
                     state.backend.schedule_render(&output);
                 }

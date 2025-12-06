@@ -89,6 +89,15 @@ logind-zbus = { version = "5.3.2", optional = true }
 futures-executor = { version = "0.3.31", features = ["thread-pool"] }
 futures-util = "0.3.31"
 
+# Video wallpaper support (optional)
+gstreamer = { version = "0.23", optional = true }
+gstreamer-video = { version = "0.23", optional = true, features = ["v1_24"] }
+gstreamer-app = { version = "0.23", optional = true, features = ["v1_24"] }
+gstreamer-allocators = { version = "0.23", optional = true }
+gstreamer-gl = { version = "0.23", optional = true }
+gstreamer-gl-egl = { version = "0.23", optional = true }
+cosmic-bg-config = { git = "https://github.com/pop-os/cosmic-bg", optional = true }
+
 [dependencies.id_tree]
 branch = "feature/copy_clone"
 git = "https://github.com/Drakulix/id-tree.git"
@@ -124,6 +133,7 @@ debug = ["egui", "egui_plot", "smithay-egui", "anyhow/backtrace"]
 default = ["systemd"]
 systemd = ["libsystemd", "logind-zbus"]
 profile-with-tracy = ["profiling/profile-with-tracy", "tracy-client/default"]
+video-wallpaper = ["gstreamer", "gstreamer-video", "gstreamer-app", "gstreamer-allocators", "gstreamer-gl", "gstreamer-gl-egl", "cosmic-bg-config"]
 
 [profile.dev.package.tiny-skia]
 opt-level = 2
@@ -144,6 +154,9 @@ lto = "fat"
 [patch."https://github.com/pop-os/cosmic-protocols"]
 cosmic-protocols = { git = "https://github.com/pop-os//cosmic-protocols", branch = "main" }
 cosmic-client-toolkit = { git = "https://github.com/pop-os//cosmic-protocols", branch = "main" }
+
+[patch."https://github.com/pop-os/cosmic-bg"]
+cosmic-bg-config = { path = "../cosmic-bg/config" }
 
 [patch.crates-io]
 smithay = { git = "https://github.com/smithay/smithay.git", rev = "d40ada5" }

@@ -387,6 +387,7 @@ impl Config {
         xdg_activation_state: &XdgActivationState,
         startup_done: Arc<AtomicBool>,
         clock: &Clock<Monotonic>,
+        #[cfg(feature = "video-wallpaper")] video_frames: crate::shell::SharedVideoFrames,
     ) -> anyhow::Result<()> {
         let outputs = output_state.outputs().collect::<Vec<_>>();
         let mut infos = outputs
@@ -455,6 +456,8 @@ impl Config {
                 xdg_activation_state,
                 startup_done.clone(),
                 clock,
+                #[cfg(feature = "video-wallpaper")]
+                video_frames.clone(),
             ) {
                 warn!(?err, "Failed to set new config.");
                 found_outputs.clear();
@@ -482,6 +485,8 @@ impl Config {
                         xdg_activation_state,
                         startup_done,
                         clock,
+                        #[cfg(feature = "video-wallpaper")]
+                        video_frames,
                     )
                     .context("Failed to reset config")?;
 
@@ -541,6 +546,8 @@ impl Config {
                     xdg_activation_state,
                     startup_done.clone(),
                     clock,
+                    #[cfg(feature = "video-wallpaper")]
+                    video_frames,
                 )
                 .context("Failed to set new config")?;
 

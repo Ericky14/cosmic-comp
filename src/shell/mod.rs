@@ -87,10 +87,17 @@ pub mod focus;
 pub mod grabs;
 pub mod layout;
 mod seats;
+#[cfg(feature = "video-wallpaper")]
+pub mod video_background;
 mod workspace;
 pub mod zoom;
 pub use self::element::{CosmicMapped, CosmicMappedRenderElement, CosmicSurface};
 pub use self::seats::*;
+#[cfg(feature = "video-wallpaper")]
+pub use self::video_background::{
+    DmaBufFrameData, DmaBufPlane, SharedVideoFrames, VideoBackgroundManager, VideoFrameData,
+    VideoFrameSource,
+};
 pub use self::workspace::*;
 use self::zoom::{OutputZoomState, ZoomState};
 

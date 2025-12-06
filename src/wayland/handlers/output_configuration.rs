@@ -152,6 +152,14 @@ impl State {
         }
 
         let mut backend = self.backend.lock();
+        #[cfg(feature = "video-wallpaper")]
+        let video_frames = self
+            .common
+            .video_background
+            .as_ref()
+            .map(|vb| vb.shared_frames())
+            .unwrap_or_default();
+
         let res = backend.apply_config_for_outputs(
             test_only,
             &self.common.event_loop_handle,
@@ -161,6 +169,8 @@ impl State {
             &self.common.xdg_activation_state,
             self.common.startup_done.clone(),
             &self.common.clock,
+            #[cfg(feature = "video-wallpaper")]
+            video_frames.clone(),
         );
         if let Err(err) = res {
             warn!("Failed to apply config. Resetting: {:?}", err);
@@ -184,6 +194,8 @@ impl State {
                     &self.common.xdg_activation_state,
                     self.common.startup_done.clone(),
                     &self.common.clock,
+                    #[cfg(feature = "video-wallpaper")]
+                    video_frames,
                 ) {
                     error!("Failed to reset output config: {:?}", err);
                 }

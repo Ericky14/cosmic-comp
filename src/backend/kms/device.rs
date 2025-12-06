@@ -10,6 +10,8 @@ use crate::{
     utils::{env::dev_list_var, prelude::*},
     wayland::handlers::screencopy::PendingImageCopyData,
 };
+#[cfg(feature = "video-wallpaper")]
+use crate::shell::SharedVideoFrames;
 
 use anyhow::{Context, Result};
 use cosmic_comp_config::output::comp::{AdaptiveSync, OutputConfig, OutputState};
@@ -350,6 +352,14 @@ impl State {
         let mut wl_outputs = Vec::new();
         let mut w = self.common.shell.read().global_space().size.w as u32;
 
+        #[cfg(feature = "video-wallpaper")]
+        let video_frames = self
+            .common
+            .video_background
+            .as_ref()
+            .map(|vb| vb.shared_frames())
+            .unwrap_or_default();
+
         {
             for (conn, maybe_crtc) in connectors {
                 match device.inner.connector_added(
@@ -362,6 +372,8 @@ impl State {
                     self.common.config.dynamic_conf.screen_filter().clone(),
                     self.common.shell.clone(),
                     self.common.startup_done.clone(),
+                    #[cfg(feature = "video-wallpaper")]
+                    video_frames.clone(),
                 ) {
                     Ok((output, should_expose)) => {
                         if should_expose {
@@ -438,6 +450,14 @@ impl State {
                     }
                 }
 
+                #[cfg(feature = "video-wallpaper")]
+                let video_frames = self
+                    .common
+                    .video_background
+                    .as_ref()
+                    .map(|vb| vb.shared_frames())
+                    .unwrap_or_default();
+
                 for (conn, maybe_crtc) in changes.added {
                     match device.inner.connector_added(
                         device.drm.device_mut(),
@@ -449,6 +469,8 @@ impl State {
                         self.common.config.dynamic_conf.screen_filter().clone(),
                         self.common.shell.clone(),
                         self.common.startup_done.clone(),
+                        #[cfg(feature = "video-wallpaper")]
+                        video_frames.clone(),
                     ) {
                         Ok((output, should_expose)) => {
                             if should_expose {
@@ -552,6 +574,14 @@ impl State {
     }
 
     pub fn refresh_output_config(&mut self) -> Result<()> {
+        #[cfg(feature = "video-wallpaper")]
+        let video_frames = self
+            .common
+            .video_background
+            .as_ref()
+            .map(|vb| vb.shared_frames())
+            .unwrap_or_default();
+
         self.common.config.read_outputs(
             &mut self.common.output_configuration_state,
             &mut self.backend,
@@ -561,6 +591,8 @@ impl State {
             &self.common.xdg_activation_state,
             self.common.startup_done.clone(),
             &self.common.clock,
+            #[cfg(feature = "video-wallpaper")]
+            video_frames,
         )?;
         self.common.refresh();
         Ok(())
@@ -752,6 +784,7 @@ impl InnerDevice {
         screen_filter: ScreenFilter,
         shell: Arc<parking_lot::RwLock<Shell>>,
         startup_done: Arc<AtomicBool>,
+        #[cfg(feature = "video-wallpaper")] video_frames: SharedVideoFrames,
     ) -> Result<(Output, bool)> {
         let output = self
             .outputs
@@ -815,6 +848,8 @@ impl InnerDevice {
                     screen_filter,
                     shell,
                     startup_done,
+                    #[cfg(feature = "video-wallpaper")]
+                    video_frames,
                 ) {
                     Ok(data) => {
                         self.surfaces.insert(crtc, data);

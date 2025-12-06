@@ -1,6 +1,6 @@
 use crate::shell::{CosmicMappedRenderElement, WorkspaceRenderElement};
 
-#[cfg(feature = "debug")]
+#[cfg(any(feature = "debug", feature = "video-wallpaper"))]
 use smithay::backend::renderer::{element::texture::TextureRenderElement, gles::GlesTexture};
 use smithay::{
     backend::renderer::{
@@ -37,6 +37,8 @@ where
         CropRenderElement<RelocateRenderElement<RescaleRenderElement<TextureShaderElement>>>,
     ),
     Zoom(MemoryRenderBufferRenderElement<R>),
+    #[cfg(feature = "video-wallpaper")]
+    VideoBackground(TextureRenderElement<GlesTexture>),
     #[cfg(feature = "debug")]
     Egui(TextureRenderElement<GlesTexture>),
 }
@@ -56,6 +58,8 @@ where
             CosmicElement::AdditionalDamage(elem) => elem.id(),
             CosmicElement::Postprocess(elem) => elem.id(),
             CosmicElement::Zoom(elem) => elem.id(),
+            #[cfg(feature = "video-wallpaper")]
+            CosmicElement::VideoBackground(elem) => elem.id(),
             #[cfg(feature = "debug")]
             CosmicElement::Egui(elem) => elem.id(),
         }
@@ -70,6 +74,8 @@ where
             CosmicElement::AdditionalDamage(elem) => elem.current_commit(),
             CosmicElement::Postprocess(elem) => elem.current_commit(),
             CosmicElement::Zoom(elem) => elem.current_commit(),
+            #[cfg(feature = "video-wallpaper")]
+            CosmicElement::VideoBackground(elem) => elem.current_commit(),
             #[cfg(feature = "debug")]
             CosmicElement::Egui(elem) => elem.current_commit(),
         }
@@ -84,6 +90,8 @@ where
             CosmicElement::AdditionalDamage(elem) => elem.src(),
             CosmicElement::Postprocess(elem) => elem.src(),
             CosmicElement::Zoom(elem) => elem.src(),
+            #[cfg(feature = "video-wallpaper")]
+            CosmicElement::VideoBackground(elem) => elem.src(),
             #[cfg(feature = "debug")]
             CosmicElement::Egui(elem) => elem.src(),
         }
@@ -98,6 +106,8 @@ where
             CosmicElement::AdditionalDamage(elem) => elem.geometry(scale),
             CosmicElement::Postprocess(elem) => elem.geometry(scale),
             CosmicElement::Zoom(elem) => elem.geometry(scale),
+            #[cfg(feature = "video-wallpaper")]
+            CosmicElement::VideoBackground(elem) => elem.geometry(scale),
             #[cfg(feature = "debug")]
             CosmicElement::Egui(elem) => elem.geometry(scale),
         }
@@ -112,6 +122,8 @@ where
             CosmicElement::AdditionalDamage(elem) => elem.location(scale),
             CosmicElement::Postprocess(elem) => elem.location(scale),
             CosmicElement::Zoom(elem) => elem.location(scale),
+            #[cfg(feature = "video-wallpaper")]
+            CosmicElement::VideoBackground(elem) => elem.location(scale),
             #[cfg(feature = "debug")]
             CosmicElement::Egui(elem) => elem.location(scale),
         }
@@ -126,6 +138,8 @@ where
             CosmicElement::AdditionalDamage(elem) => elem.transform(),
             CosmicElement::Postprocess(elem) => elem.transform(),
             CosmicElement::Zoom(elem) => elem.transform(),
+            #[cfg(feature = "video-wallpaper")]
+            CosmicElement::VideoBackground(elem) => elem.transform(),
             #[cfg(feature = "debug")]
             CosmicElement::Egui(elem) => elem.transform(),
         }
@@ -144,6 +158,8 @@ where
             CosmicElement::AdditionalDamage(elem) => elem.damage_since(scale, commit),
             CosmicElement::Postprocess(elem) => elem.damage_since(scale, commit),
             CosmicElement::Zoom(elem) => elem.damage_since(scale, commit),
+            #[cfg(feature = "video-wallpaper")]
+            CosmicElement::VideoBackground(elem) => elem.damage_since(scale, commit),
             #[cfg(feature = "debug")]
             CosmicElement::Egui(elem) => elem.damage_since(scale, commit),
         }
@@ -158,6 +174,8 @@ where
             CosmicElement::AdditionalDamage(elem) => elem.opaque_regions(scale),
             CosmicElement::Postprocess(elem) => elem.opaque_regions(scale),
             CosmicElement::Zoom(elem) => elem.opaque_regions(scale),
+            #[cfg(feature = "video-wallpaper")]
+            CosmicElement::VideoBackground(elem) => elem.opaque_regions(scale),
             #[cfg(feature = "debug")]
             CosmicElement::Egui(elem) => elem.opaque_regions(scale),
         }
@@ -172,6 +190,8 @@ where
             CosmicElement::AdditionalDamage(elem) => elem.alpha(),
             CosmicElement::Postprocess(elem) => elem.alpha(),
             CosmicElement::Zoom(elem) => elem.alpha(),
+            #[cfg(feature = "video-wallpaper")]
+            CosmicElement::VideoBackground(elem) => elem.alpha(),
             #[cfg(feature = "debug")]
             CosmicElement::Egui(elem) => elem.alpha(),
         }
@@ -186,6 +206,8 @@ where
             CosmicElement::AdditionalDamage(elem) => elem.kind(),
             CosmicElement::Postprocess(elem) => elem.kind(),
             CosmicElement::Zoom(elem) => elem.kind(),
+            #[cfg(feature = "video-wallpaper")]
+            CosmicElement::VideoBackground(elem) => elem.kind(),
             #[cfg(feature = "debug")]
             CosmicElement::Egui(elem) => elem.kind(),
         }
@@ -228,6 +250,19 @@ where
                 .map_err(FromGlesError::from_gles_error)
             }
             CosmicElement::Zoom(elem) => elem.draw(frame, src, dst, damage, opaque_regions),
+            #[cfg(feature = "video-wallpaper")]
+            CosmicElement::VideoBackground(elem) => {
+                let glow_frame = R::glow_frame_mut(frame);
+                RenderElement::<GlowRenderer>::draw(
+                    elem,
+                    glow_frame,
+                    src,
+                    dst,
+                    damage,
+                    opaque_regions,
+                )
+                .map_err(FromGlesError::from_gles_error)
+            }
             #[cfg(feature = "debug")]
             CosmicElement::Egui(elem) => {
                 let glow_frame = R::glow_frame_mut(frame);
@@ -256,6 +291,11 @@ where
                 elem.underlying_storage(glow_renderer)
             }
             CosmicElement::Zoom(elem) => elem.underlying_storage(renderer),
+            #[cfg(feature = "video-wallpaper")]
+            CosmicElement::VideoBackground(elem) => {
+                let glow_renderer = renderer.glow_renderer_mut();
+                elem.underlying_storage(glow_renderer)
+            }
             #[cfg(feature = "debug")]
             CosmicElement::Egui(elem) => {
                 let glow_renderer = renderer.glow_renderer_mut();

@@ -47,13 +47,43 @@ pub struct WinitState {
 
 impl WinitState {
     #[profiling::function]
-    pub fn render_output(&mut self, state: &mut Common) -> Result<()> {
+    pub fn render_output(&mut self, state: &mut Common) -> Result<bool> {
         let age = self.backend.buffer_age().unwrap_or(0);
         let (renderer, mut fb) = self
             .backend
             .bind()
             .with_context(|| "Failed to bind buffer")?;
-        match render::render_output(
+
+        #[cfg(feature = "video-wallpaper")]
+        let has_video = state
+            .video_background
+            .as_ref()
+            .map(|vm| vm.has_video(&self.output.name()))
+            .unwrap_or(false);
+        #[cfg(not(feature = "video-wallpaper"))]
+        let has_video = false;
+
+        #[cfg(feature = "video-wallpaper")]
+        let result = {
+            let video_manager = state.video_background.as_mut();
+            render::render_output_with_video(
+                None,
+                renderer,
+                &mut fb,
+                &mut self.damage_tracker,
+                age,
+                &state.shell,
+                state.clock.now(),
+                &self.output,
+                CursorMode::NotDefault,
+                &mut self.screen_filter_state,
+                &state.event_loop_handle,
+                video_manager,
+            )
+        };
+
+        #[cfg(not(feature = "video-wallpaper"))]
+        let result = render::render_output(
             None,
             renderer,
             &mut fb,
@@ -65,7 +95,9 @@ impl WinitState {
             CursorMode::NotDefault,
             &mut self.screen_filter_state,
             &state.event_loop_handle,
-        ) {
+        );
+
+        match result {
             Ok(RenderOutputResult { damage, states, .. }) => {
                 std::mem::drop(fb);
                 self.backend
@@ -99,7 +131,7 @@ impl WinitState {
             }
         };
 
-        Ok(())
+        Ok(has_video)
     }
 
     pub fn all_outputs(&self) -> Vec<Output> {
@@ -183,9 +215,17 @@ pub fn init_backend(
         event_loop
             .handle()
             .insert_source(render_source, move |_, _, state| {
-                if let Err(err) = state.backend.winit().render_output(&mut state.common) {
-                    error!(?err, "Failed to render frame.");
-                    render_ping.ping();
+                match state.backend.winit().render_output(&mut state.common) {
+                    Ok(has_video) => {
+                        // If video is playing, schedule another redraw
+                        if has_video {
+                            render_ping.ping();
+                        }
+                    }
+                    Err(err) => {
+                        error!(?err, "Failed to render frame.");
+                        render_ping.ping();
+                    }
                 }
                 profiling::finish_frame!();
             })
@@ -227,6 +267,14 @@ pub fn init_backend(
         .add_heads(std::iter::once(&output));
     {
         state.common.add_output(&output);
+        #[cfg(feature = "video-wallpaper")]
+        let video_frames = state
+            .common
+            .video_background
+            .as_ref()
+            .map(|vb| vb.shared_frames())
+            .unwrap_or_default();
+
         if let Err(err) = state.common.config.read_outputs(
             &mut state.common.output_configuration_state,
             &mut state.backend,
@@ -236,6 +284,8 @@ pub fn init_backend(
             &state.common.xdg_activation_state,
             state.common.startup_done.clone(),
             &state.common.clock,
+            #[cfg(feature = "video-wallpaper")]
+            video_frames,
         ) {
             error!("Unrecoverable output config error: {}", err);
         }

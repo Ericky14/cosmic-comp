@@ -22,6 +22,9 @@ use crate::{
     },
 };
 
+#[cfg(feature = "video-wallpaper")]
+use crate::shell::SharedVideoFrames;
+
 use anyhow::{Context, Result};
 use calloop::channel::Channel;
 use cosmic_comp_config::output::comp::AdaptiveSync;
@@ -158,6 +161,18 @@ pub struct SurfaceThreadState {
     #[cfg(feature = "debug")]
     egui: EguiState,
 
+    #[cfg(feature = "video-wallpaper")]
+    video_frames: SharedVideoFrames,
+    #[cfg(feature = "video-wallpaper")]
+    video_texture: Option<(
+        smithay::backend::renderer::element::texture::TextureRenderBuffer<
+            smithay::backend::renderer::gles::GlesTexture,
+        >,
+        smithay::utils::Size<i32, Physical>,
+    )>,
+    #[cfg(feature = "video-wallpaper")]
+    last_video_sequence: u64,
+
     last_sequence: Option<u32>,
     /// Tracy frame that goes from vblank to vblank.
     vblank_frame: Option<tracy_client::Frame>,
@@ -251,6 +266,7 @@ impl Surface {
         screen_filter: ScreenFilter,
         shell: Arc<parking_lot::RwLock<Shell>>,
         startup_done: Arc<AtomicBool>,
+        #[cfg(feature = "video-wallpaper")] video_frames: SharedVideoFrames,
     ) -> Result<Self> {
         let (tx, rx) = channel::<ThreadCommand>();
         let (tx2, rx2) = channel::<SurfaceCommand>();
@@ -258,6 +274,8 @@ impl Surface {
 
         let active_clone = active.clone();
         let output_clone = output.clone();
+        #[cfg(feature = "video-wallpaper")]
+        let video_frames_clone = video_frames.clone();
 
         let thread = std::thread::Builder::new()
             .name(format!("surface-{}", output.name()))
@@ -272,6 +290,8 @@ impl Surface {
                     tx2,
                     rx,
                     startup_done,
+                    #[cfg(feature = "video-wallpaper")]
+                    video_frames_clone,
                 ) {
                     error!("Surface thread crashed: {}", err);
                 }
@@ -499,6 +519,7 @@ fn surface_thread(
     thread_sender: Sender<SurfaceCommand>,
     thread_receiver: Channel<ThreadCommand>,
     startup_done: Arc<AtomicBool>,
+    #[cfg(feature = "video-wallpaper")] video_frames: SharedVideoFrames,
 ) -> Result<()> {
     let name = output.name();
     profiling::register_thread!(&format!("Surface Thread {}", name));
@@ -550,6 +571,13 @@ fn surface_thread(
         clock: Clock::new(),
         #[cfg(feature = "debug")]
         egui,
+
+        #[cfg(feature = "video-wallpaper")]
+        video_frames,
+        #[cfg(feature = "video-wallpaper")]
+        video_texture: None,
+        #[cfg(feature = "video-wallpaper")]
+        last_video_sequence: 0,
 
         last_sequence: None,
         vblank_frame: None,
@@ -661,6 +689,230 @@ fn surface_thread(
         .context("Failed to listen for events")?;
 
     event_loop.run(None, &mut state, |_| {}).map_err(Into::into)
+}
+
+/// Update video texture from shared frames and return a render element if available.
+/// This is a free function to avoid borrow conflicts in the render loop.
+/// Returns (element, has_new_frame) where has_new_frame indicates if we should schedule another render.
+#[cfg(feature = "video-wallpaper")]
+fn update_video_texture(
+    video_frames: &SharedVideoFrames,
+    video_texture: &mut Option<(
+        smithay::backend::renderer::element::texture::TextureRenderBuffer<GlesTexture>,
+        smithay::utils::Size<i32, Physical>,
+    )>,
+    last_video_sequence: &mut u64,
+    output: &Output,
+    renderer: &mut GlMultiRenderer<'_>,
+) -> (
+    Option<smithay::backend::renderer::element::texture::TextureRenderElement<GlesTexture>>,
+    bool,
+) {
+    use crate::backend::render::element::AsGlowRenderer;
+    use crate::shell::VideoFrameSource;
+    use smithay::backend::renderer::ImportMem;
+    use smithay::backend::renderer::element::texture::TextureRenderBuffer;
+    use smithay::utils::Rectangle;
+
+    let output_name = output.name();
+
+    // Check if video is active
+    if !video_frames.is_active() {
+        return (None, false);
+    }
+
+    // Get frame data for this output
+    let frame_data = match video_frames.get(&output_name) {
+        Some(data) => data,
+        None => return (None, false),
+    };
+
+    let mut has_new_frame = false;
+
+    // Get output info
+    let output_mode = match output.current_mode() {
+        Some(mode) => mode,
+        None => return (None, true),
+    };
+    let output_physical_size = output_mode.size;
+    let output_scale = output.current_scale().fractional_scale();
+
+    // Only update texture if frame sequence changed
+    if frame_data.sequence != *last_video_sequence {
+        has_new_frame = true;
+        *last_video_sequence = frame_data.sequence;
+
+        let size = smithay::utils::Size::from((frame_data.size.w, frame_data.size.h));
+
+        // Get the underlying GlesRenderer for texture creation
+        let gles_renderer: &mut GlesRenderer =
+            std::borrow::BorrowMut::borrow_mut(renderer.glow_renderer_mut());
+
+        // Handle DMA-BUF separately (always creates new texture - already zero-copy)
+        if let VideoFrameSource::DmaBuf(dmabuf_data) = &frame_data.source {
+            match import_dmabuf_texture(gles_renderer, dmabuf_data, size) {
+                Ok(texture) => {
+                    let buffer = TextureRenderBuffer::from_texture(
+                        gles_renderer,
+                        texture,
+                        1,
+                        Transform::Normal,
+                        None,
+                    );
+                    *video_texture = Some((buffer, frame_data.size));
+                }
+                Err(err) => {
+                    tracing::warn!("Failed to import DMA-BUF video frame: {}", err);
+                    return (None, true);
+                }
+            }
+        } else if let VideoFrameSource::Cpu(pixels) = &frame_data.source {
+            // For CPU frames: reuse existing texture if size matches, otherwise create new
+            let needs_new_texture = match video_texture.as_ref() {
+                Some((_, existing_size)) => *existing_size != frame_data.size,
+                None => true,
+            };
+
+            if needs_new_texture {
+                // First frame or size changed - create new texture
+                match gles_renderer.import_memory(pixels, Fourcc::Argb8888, size, false) {
+                    Ok(texture) => {
+                        let buffer = TextureRenderBuffer::from_texture(
+                            gles_renderer,
+                            texture,
+                            1,
+                            Transform::Normal,
+                            None,
+                        );
+                        *video_texture = Some((buffer, frame_data.size));
+                        if *last_video_sequence <= 3 {
+                            tracing::info!(
+                                "Created new video texture {}x{}",
+                                frame_data.size.w,
+                                frame_data.size.h
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!("Failed to create video texture: {:?}", err);
+                        return (None, true);
+                    }
+                }
+            } else {
+                // Subsequent frames - update existing texture in-place (FAST PATH)
+                if let Some((buffer, _)) = video_texture.as_mut() {
+                    let region = Rectangle::from_size(size);
+                    if let Err(err) = buffer.update_from_memory(gles_renderer, pixels, region, None)
+                    {
+                        tracing::warn!("Failed to update video texture: {:?}", err);
+                        // Fall back to creating new texture
+                        *video_texture = None;
+                        return (None, true);
+                    }
+                }
+            }
+        }
+    }
+
+    // Create render element from the texture buffer
+    let (texture_buffer, video_size) = match video_texture.as_ref() {
+        Some(t) => t,
+        None => return (None, true), // Still active, try again
+    };
+
+    // Get output dimensions in physical pixels
+    let output_w = output_physical_size.w as f64;
+    let output_h = output_physical_size.h as f64;
+
+    // Video dimensions
+    let video_w = video_size.w as f64;
+    let video_h = video_size.h as f64;
+
+    // Calculate scale to COVER the output (zoom mode - may crop edges)
+    let scale_x = output_w / video_w;
+    let scale_y = output_h / video_h;
+    let scale = scale_x.max(scale_y);
+
+    // Scaled video size in physical pixels
+    let scaled_w = video_w * scale;
+    let scaled_h = video_h * scale;
+
+    // Center offset (negative means crop that edge)
+    let offset_x = (output_w - scaled_w) / 2.0;
+    let offset_y = (output_h - scaled_h) / 2.0;
+
+    // Log video render info periodically
+    if has_new_frame && (*last_video_sequence <= 5 || *last_video_sequence % 120 == 0) {
+        let is_dmabuf = frame_data.is_dmabuf();
+        tracing::info!(
+            output = %output_name,
+            video = ?(video_w, video_h),
+            output_phys = ?(output_w, output_h),
+            output_scale,
+            render_scale = scale,
+            scaled = ?(scaled_w, scaled_h),
+            offset = ?(offset_x, offset_y),
+            frame_seq = *last_video_sequence,
+            dmabuf = is_dmabuf,
+            "Video render"
+        );
+    }
+
+    // Position in physical coordinates
+    let location = Point::<f64, Physical>::from((offset_x, offset_y));
+
+    // Destination size - use physical size divided by output scale to get logical
+    // TextureRenderElement expects logical size for dst_size
+    let dst_w = (scaled_w / output_scale) as i32;
+    let dst_h = (scaled_h / output_scale) as i32;
+    let dst_size = smithay::utils::Size::<i32, smithay::utils::Logical>::from((dst_w, dst_h));
+
+    (Some(smithay::backend::renderer::element::texture::TextureRenderElement::from_texture_render_buffer(
+        location,
+        texture_buffer,
+        Some(1.0), // alpha
+        None, // src - use full texture
+        Some(dst_size), // destination size for scaling
+        smithay::backend::renderer::element::Kind::Unspecified,
+    )), has_new_frame)
+}
+
+/// Import a DMA-BUF frame as a GlesTexture.
+#[cfg(feature = "video-wallpaper")]
+fn import_dmabuf_texture(
+    renderer: &mut GlesRenderer,
+    dmabuf_data: &crate::shell::DmaBufFrameData,
+    size: smithay::utils::Size<i32, smithay::utils::Buffer>,
+) -> Result<GlesTexture, String> {
+    use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
+    use std::os::fd::AsFd;
+
+    // Build smithay Dmabuf from our frame data
+    let mut builder = Dmabuf::builder(
+        (size.w, size.h), // Size<i32, Buffer>
+        dmabuf_data.format,
+        dmabuf_data.modifier,
+        DmabufFlags::empty(),
+    );
+
+    // Add planes - we need to dup the fd since add_plane takes ownership
+    for (idx, plane) in dmabuf_data.planes.iter().enumerate() {
+        // Duplicate the fd since add_plane takes ownership
+        let dup_fd = match rustix::io::fcntl_dupfd_cloexec(plane.fd.as_fd(), 0) {
+            Ok(fd) => fd,
+            Err(e) => return Err(format!("Failed to dup DMA-BUF fd: {}", e)),
+        };
+        builder.add_plane(dup_fd, idx as u32, plane.offset, plane.stride);
+    }
+
+    let dmabuf = builder
+        .build()
+        .ok_or_else(|| "Failed to build Dmabuf".to_string())?;
+
+    // Import via ImportDma trait
+    renderer
+        .import_dmabuf(&dmabuf, None)
+        .map_err(|e| format!("Failed to import DMA-BUF: {:?}", e))
 }
 
 impl SurfaceThreadState {
@@ -860,6 +1112,11 @@ impl SurfaceThreadState {
             QueueState::WaitingForEstimatedVBlankAndQueued { .. } => unreachable!(),
         };
 
+        // Note: For video wallpaper, we DON'T force constant redraws here.
+        // Instead, the main event loop's poll_frames() timer calls schedule_render()
+        // when new video frames arrive (at ~30fps). This saves CPU by not redrawing
+        // at 165Hz when video only updates at 30fps.
+
         if redraw_needed || self.shell.read().animations_going() {
             let vblank_frame = tracy_client::Client::running()
                 .unwrap()
@@ -887,7 +1144,13 @@ impl SurfaceThreadState {
 
         self.frame_callback_seq = self.frame_callback_seq.wrapping_add(1);
 
-        if force || self.shell.read().animations_going() {
+        // Note: For video wallpaper, check if video is active to enable continuous rendering.
+        #[cfg(feature = "video-wallpaper")]
+        let video_active = self.video_frames.is_active();
+        #[cfg(not(feature = "video-wallpaper"))]
+        let video_active = false;
+
+        if force || self.shell.read().animations_going() || video_active {
             self.queue_redraw(false);
         }
         self.send_frame_callbacks();
@@ -1048,6 +1311,24 @@ impl SurfaceThreadState {
         .map_err(|err| {
             anyhow::format_err!("Failed to accumulate elements for rendering: {:?}", err)
         })?;
+
+        // Add video background element (rendered behind everything else)
+        #[cfg(feature = "video-wallpaper")]
+        let _video_needs_redraw = {
+            let (video_element, needs_redraw) = update_video_texture(
+                &self.video_frames,
+                &mut self.video_texture,
+                &mut self.last_video_sequence,
+                &self.output,
+                &mut renderer,
+            );
+            if let Some(elem) = video_element {
+                elements.push(CosmicElement::VideoBackground(elem));
+            }
+            needs_redraw
+        };
+        #[cfg(not(feature = "video-wallpaper"))]
+        let _video_needs_redraw = false;
 
         if vrr && fullscreen_drives_refresh_rate && !self.timings.past_min_render_time(&self.clock)
         {

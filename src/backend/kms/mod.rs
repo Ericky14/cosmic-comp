@@ -6,6 +6,8 @@ use crate::{
     state::BackendData,
     utils::{env::dev_var, prelude::*},
 };
+#[cfg(feature = "video-wallpaper")]
+use crate::shell::SharedVideoFrames;
 
 use anyhow::{Context, Result};
 use calloop::LoopSignal;
@@ -721,6 +723,7 @@ impl KmsGuard<'_> {
         shell: Arc<parking_lot::RwLock<Shell>>,
         startup_done: Arc<AtomicBool>,
         clock: &Clock<Monotonic>,
+        #[cfg(feature = "video-wallpaper")] video_frames: SharedVideoFrames,
     ) -> Result<(), anyhow::Error> {
         if !self.session.is_active() {
             return Ok(());
@@ -828,6 +831,8 @@ impl KmsGuard<'_> {
                         screen_filter.clone(),
                         shell.clone(),
                         startup_done.clone(),
+                        #[cfg(feature = "video-wallpaper")]
+                        video_frames.clone(),
                     )?;
                     if output.mirroring().is_none() {
                         w += output.geometry().size.w as u32;

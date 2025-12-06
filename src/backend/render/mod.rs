@@ -41,7 +41,7 @@ use smithay::{
         allocator::{Fourcc, dmabuf::Dmabuf},
         drm::{DrmDeviceFd, DrmNode},
         renderer::{
-            Bind, Blit, Color32F, ExportMem, ImportAll, ImportMem, Offscreen, Renderer, Texture,
+            Bind, Blit, Color32F, ExportMem, ImportAll, ImportDma, ImportMem, Offscreen, Renderer, Texture,
             TextureFilter,
             damage::{Error as RenderError, OutputDamageTracker, RenderOutputResult},
             element::{
@@ -1469,6 +1469,51 @@ where
     CosmicMappedRenderElement<R>: RenderElement<R>,
     WorkspaceRenderElement<R>: RenderElement<R>,
 {
+    render_workspace_with_extra(
+        gpu,
+        renderer,
+        target,
+        damage_tracker,
+        age,
+        additional_damage,
+        shell,
+        zoom_level,
+        now,
+        output,
+        previous,
+        current,
+        cursor_mode,
+        element_filter,
+        Vec::new(), // No extra elements
+    )
+}
+
+/// Render workspace with extra elements appended at the end (rendered behind everything).
+pub fn render_workspace_with_extra<'d, R>(
+    gpu: Option<&DrmNode>,
+    renderer: &mut R,
+    target: &mut R::Framebuffer<'_>,
+    damage_tracker: &'d mut OutputDamageTracker,
+    age: usize,
+    additional_damage: Option<Vec<Rectangle<i32, Logical>>>,
+    shell: &Arc<parking_lot::RwLock<Shell>>,
+    zoom_level: Option<&ZoomState>,
+    now: Time<Monotonic>,
+    output: &Output,
+    previous: Option<(WorkspaceHandle, usize, WorkspaceDelta)>,
+    current: (WorkspaceHandle, usize),
+    cursor_mode: CursorMode,
+    element_filter: ElementFilter,
+    extra_background_elements: Vec<CosmicElement<R>>,
+) -> Result<(RenderOutputResult<'d>, Vec<CosmicElement<R>>), RenderError<R::Error>>
+where
+    R: Renderer + ImportAll + ImportMem + ExportMem + Bind<Dmabuf> + AsGlowRenderer,
+    R::TextureId: Send + Clone + 'static,
+    R::Error: FromGlesError,
+    CosmicElement<R>: RenderElement<R>,
+    CosmicMappedRenderElement<R>: RenderElement<R>,
+    WorkspaceRenderElement<R>: RenderElement<R>,
+{
     let mut elements: Vec<CosmicElement<R>> = workspace_elements(
         gpu,
         renderer,
@@ -1493,6 +1538,9 @@ where
         );
     }
 
+    // Add extra background elements at the end (rendered behind everything else)
+    elements.extend(extra_background_elements);
+
     let res = damage_tracker.render_output(
         renderer,
         target,
@@ -1502,4 +1550,139 @@ where
     );
 
     res.map(|res| (res, elements))
+}
+
+/// Generate video background render element for an output.
+///
+/// This function creates a video background element from the VideoBackgroundManager
+/// that should be added at the END of the elements list (rendered behind everything).
+#[cfg(feature = "video-wallpaper")]
+pub fn video_background_element<R>(
+    renderer: &mut R,
+    video_manager: &mut crate::shell::VideoBackgroundManager,
+    output: &Output,
+) -> Option<CosmicElement<R>>
+where
+    R: Renderer<TextureId = smithay::backend::renderer::gles::GlesTexture>
+        + ImportAll
+        + ImportMem
+        + ImportDma
+        + AsGlowRenderer,
+    R::TextureId: 'static,
+    CosmicMappedRenderElement<R>: RenderElement<R>,
+{
+    let output_name = output.name();
+
+    // Poll for new frames
+    video_manager.poll_frames();
+
+    // Get the render element from the video manager
+    let texture_element = video_manager.get_render_element(renderer, &output_name)?;
+
+    Some(CosmicElement::VideoBackground(texture_element))
+}
+
+/// Render output with video wallpaper support.
+///
+/// This is a wrapper around `render_output` that adds video background support.
+/// The video background is rendered behind all other content.
+///
+/// NOTE: Video backgrounds are currently only rendered when no screen filter is active.
+/// Full integration with screen filters requires additional work.
+#[cfg(feature = "video-wallpaper")]
+#[profiling::function]
+pub fn render_output_with_video<'d, R>(
+    gpu: Option<&DrmNode>,
+    renderer: &mut R,
+    target: &mut R::Framebuffer<'_>,
+    damage_tracker: &'d mut OutputDamageTracker,
+    age: usize,
+    shell: &Arc<parking_lot::RwLock<Shell>>,
+    now: Time<Monotonic>,
+    output: &Output,
+    cursor_mode: CursorMode,
+    screen_filter: &'d mut ScreenFilterStorage,
+    _loop_handle: &calloop::LoopHandle<'static, State>,
+    video_manager: Option<&mut crate::shell::VideoBackgroundManager>,
+) -> Result<RenderOutputResult<'d>, RenderError<R::Error>>
+where
+    R: Renderer<TextureId = smithay::backend::renderer::gles::GlesTexture>
+        + ImportAll
+        + ImportMem
+        + ExportMem
+        + Bind<Dmabuf>
+        + Offscreen<GlesTexture>
+        + Blit
+        + ImportDma
+        + AsGlowRenderer,
+    R::TextureId: Send + Clone + 'static,
+    R::Error: FromGlesError,
+    CosmicElement<R>: RenderElement<R>,
+    CosmicMappedRenderElement<R>: RenderElement<R>,
+    WorkspaceRenderElement<R>: RenderElement<R>,
+{
+    // Generate video background element if available
+    let video_elements: Vec<CosmicElement<R>> = video_manager
+        .and_then(|vm| video_background_element(renderer, vm, output))
+        .into_iter()
+        .collect();
+
+    // If there's no screen filter and we have video elements, use enhanced render path
+    if screen_filter.filter.is_noop() && !video_elements.is_empty() {
+        let shell_ref = shell.read();
+        let (previous_workspace, workspace) = shell_ref
+            .workspaces
+            .active(output)
+            .ok_or(RenderError::OutputNoMode(OutputNoMode))?;
+        let (previous_idx, idx) = shell_ref.workspaces.active_num(output);
+        let previous_workspace = previous_workspace
+            .zip(previous_idx)
+            .map(|((w, start), idx)| (w.handle, idx, start));
+        let workspace = (workspace.handle, idx);
+        let zoom_state = shell_ref.zoom_state().cloned();
+        std::mem::drop(shell_ref);
+
+        let element_filter = if crate::utils::quirks::workspace_overview_is_open(output) {
+            ElementFilter::LayerShellOnly
+        } else {
+            ElementFilter::All
+        };
+
+        let result = render_workspace_with_extra(
+            gpu,
+            renderer,
+            target,
+            damage_tracker,
+            age,
+            None,
+            shell,
+            zoom_state.as_ref(),
+            now,
+            output,
+            previous_workspace,
+            workspace,
+            cursor_mode,
+            element_filter,
+            video_elements,
+        );
+
+        // Note: We skip screencopy handling here for simplicity.
+        // Full screencopy support with video would require more work.
+        result.map(|(res, _elements)| res)
+    } else {
+        // Fall back to regular render_output (no video when screen filter is active)
+        render_output(
+            gpu,
+            renderer,
+            target,
+            damage_tracker,
+            age,
+            shell,
+            now,
+            output,
+            cursor_mode,
+            screen_filter,
+            _loop_handle,
+        )
+    }
 }

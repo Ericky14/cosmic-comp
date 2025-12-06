@@ -30,6 +30,8 @@ use crate::{
     },
     xwayland::XWaylandState,
 };
+#[cfg(feature = "video-wallpaper")]
+use crate::shell::VideoBackgroundManager;
 use anyhow::Context;
 use calloop::RegistrationToken;
 use cosmic_comp_config::output::comp::{OutputConfig, OutputState};
@@ -272,6 +274,9 @@ pub struct Common {
 
     #[cfg(feature = "systemd")]
     pub inhibit_lid_fd: Option<OwnedFd>,
+
+    #[cfg(feature = "video-wallpaper")]
+    pub video_background: Option<VideoBackgroundManager>,
 }
 
 #[derive(Debug)]
@@ -464,6 +469,7 @@ impl LockedBackend<'_> {
         xdg_activation_state: &XdgActivationState,
         startup_done: Arc<AtomicBool>,
         clock: &Clock<Monotonic>,
+        #[cfg(feature = "video-wallpaper")] video_frames: crate::shell::SharedVideoFrames,
     ) -> Result<(), anyhow::Error> {
         let all_outputs = self.all_outputs();
 
@@ -504,6 +510,8 @@ impl LockedBackend<'_> {
                 shell.clone(),
                 startup_done,
                 clock,
+                #[cfg(feature = "video-wallpaper")]
+                video_frames,
             ),
             LockedBackend::Winit(state) => state.apply_config_for_outputs(test_only),
             LockedBackend::X11(state) => state.apply_config_for_outputs(test_only),
@@ -769,6 +777,85 @@ impl State {
 
                 #[cfg(feature = "systemd")]
                 inhibit_lid_fd: None,
+
+                #[cfg(feature = "video-wallpaper")]
+                video_background: {
+                    tracing::info!("Video wallpaper feature enabled, checking configuration...");
+                    
+                    // Helper to check if a path is a video file
+                    fn is_video_file(path: &std::path::Path) -> bool {
+                        let video_extensions = ["mp4", "mkv", "webm", "avi", "mov", "m4v", "ogv", "wmv"];
+                        path.extension()
+                            .and_then(|ext| ext.to_str())
+                            .map(|ext| video_extensions.contains(&ext.to_lowercase().as_str()))
+                            .unwrap_or(false)
+                    }
+                    
+                    // First check COSMIC_VIDEO_WALLPAPER env var for quick testing
+                    if let Ok(video_path) = std::env::var("COSMIC_VIDEO_WALLPAPER") {
+                        let path = std::path::Path::new(&video_path);
+                        if path.exists() {
+                            let mut manager = VideoBackgroundManager::new();
+                            if let Err(e) = manager.init() {
+                                tracing::error!("Failed to initialize video background: {}", e);
+                                None
+                            } else if let Err(e) = manager.set_default_video(path) {
+                                tracing::error!("Failed to set video wallpaper: {}", e);
+                                None
+                            } else {
+                                tracing::info!("Video wallpaper enabled (env): {}", video_path);
+                                Some(manager)
+                            }
+                        } else {
+                            tracing::warn!("Video wallpaper file not found: {}", video_path);
+                            None
+                        }
+                    } else {
+                        tracing::debug!("No COSMIC_VIDEO_WALLPAPER env var, checking cosmic-bg-config...");
+                        // Check cosmic-bg-config for video wallpaper
+                        match cosmic_bg_config::context() {
+                            Ok(ctx) => {
+                                let entry = ctx.default_background();
+                                tracing::debug!("cosmic-bg-config loaded, source: {:?}", entry.source);
+                                // Check for explicit Video source or Path source with video extension
+                                let video_path = entry.source.video_path().cloned().or_else(|| {
+                                    match &entry.source {
+                                        cosmic_bg_config::Source::Path(path) if is_video_file(path) => {
+                                            Some(path.clone())
+                                        }
+                                        _ => None,
+                                    }
+                                });
+                                
+                                if let Some(video_path) = video_path {
+                                    if video_path.exists() {
+                                        let mut manager = VideoBackgroundManager::new();
+                                        if let Err(e) = manager.init() {
+                                            tracing::error!("Failed to initialize video background: {}", e);
+                                            None
+                                        } else if let Err(e) = manager.set_default_video(&video_path) {
+                                            tracing::error!("Failed to set video wallpaper: {}", e);
+                                            None
+                                        } else {
+                                            tracing::info!("Video wallpaper enabled (config): {}", video_path.display());
+                                            Some(manager)
+                                        }
+                                    } else {
+                                        tracing::warn!("Video wallpaper file not found: {}", video_path.display());
+                                        None
+                                    }
+                                } else {
+                                    // No video configured
+                                    None
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!("Could not load cosmic-bg config: {}", e);
+                                None
+                            }
+                        }
+                    }
+                },
             },
             backend: BackendData::Unset,
             ready: Once::new(),

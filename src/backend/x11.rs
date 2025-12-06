@@ -128,13 +128,17 @@ impl X11State {
                     .iter_mut()
                     .find(|s| s.output == output_ref)
                 {
-                    if let Err(err) =
-                        surface.render_output(&mut x11_state.renderer, &mut state.common)
-                    {
-                        error!(?err, "Error rendering.");
+                    match surface.render_output(&mut x11_state.renderer, &mut state.common) {
+                        Ok(has_video) => {
+                            surface.dirty = has_video; // Keep dirty if video is playing
+                            surface.pending = true;
+                        }
+                        Err(err) => {
+                            error!(?err, "Error rendering.");
+                            surface.dirty = false;
+                            surface.pending = true;
+                        }
                     }
-                    surface.dirty = false;
-                    surface.pending = true;
                 }
             })
             .with_context(|| "Failed to add output to event loop")?;
@@ -212,7 +216,11 @@ pub struct Surface {
 }
 
 impl Surface {
-    pub fn render_output(&mut self, renderer: &mut GlowRenderer, state: &mut Common) -> Result<()> {
+    pub fn render_output(
+        &mut self,
+        renderer: &mut GlowRenderer,
+        state: &mut Common,
+    ) -> Result<bool> {
         let (mut buffer, age) = self
             .surface
             .buffer()
@@ -220,7 +228,37 @@ impl Surface {
         let mut fb = renderer
             .bind(&mut buffer)
             .with_context(|| "Failed to bind dmabuf")?;
-        match render::render_output(
+
+        #[cfg(feature = "video-wallpaper")]
+        let has_video = state
+            .video_background
+            .as_ref()
+            .map(|vm| vm.has_video(&self.output.name()))
+            .unwrap_or(false);
+        #[cfg(not(feature = "video-wallpaper"))]
+        let has_video = false;
+
+        #[cfg(feature = "video-wallpaper")]
+        let result = {
+            let video_manager = state.video_background.as_mut();
+            render::render_output_with_video(
+                None,
+                renderer,
+                &mut fb,
+                &mut self.damage_tracker,
+                age as usize,
+                &state.shell,
+                state.clock.now(),
+                &self.output,
+                render::CursorMode::NotDefault,
+                &mut self.screen_filter_state,
+                &state.event_loop_handle,
+                video_manager,
+            )
+        };
+
+        #[cfg(not(feature = "video-wallpaper"))]
+        let result = render::render_output(
             None,
             renderer,
             &mut fb,
@@ -232,7 +270,9 @@ impl Surface {
             render::CursorMode::NotDefault,
             &mut self.screen_filter_state,
             &state.event_loop_handle,
-        ) {
+        );
+
+        match result {
             Ok(RenderOutputResult { damage, states, .. }) => {
                 self.surface
                     .submit()
@@ -266,7 +306,7 @@ impl Surface {
             }
         };
 
-        Ok(())
+        Ok(has_video)
     }
 }
 
@@ -370,6 +410,14 @@ pub fn init_backend(
         .add_heads(std::iter::once(&output));
     {
         state.common.add_output(&output);
+        #[cfg(feature = "video-wallpaper")]
+        let video_frames = state
+            .common
+            .video_background
+            .as_ref()
+            .map(|vb| vb.shared_frames())
+            .unwrap_or_default();
+
         if let Err(err) = state.common.config.read_outputs(
             &mut state.common.output_configuration_state,
             &mut state.backend,
@@ -379,6 +427,8 @@ pub fn init_backend(
             &state.common.xdg_activation_state,
             state.common.startup_done.clone(),
             &state.common.clock,
+            #[cfg(feature = "video-wallpaper")]
+            video_frames,
         ) {
             error!("Unrecoverable output configuration error: {}", err);
         }
