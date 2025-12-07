@@ -160,8 +160,7 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
     #[cfg(feature = "video-wallpaper")]
     if state.common.video_background.is_some() {
         use std::time::Duration;
-        // Timer to poll video frames - match video framerate (30fps = 33ms)
-        // Polling faster wastes CPU, polling slower misses frames
+        // Timer to poll video frames at ~30fps (33ms interval)
         let video_timer = Timer::from_duration(Duration::from_millis(32));
         if let Err(e) = event_loop.handle().insert_source(video_timer, |_, _, state| {
             // Poll video frames

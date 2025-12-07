@@ -717,14 +717,44 @@ fn update_video_texture(
     let output_name = output.name();
 
     // Check if video is active
-    if !video_frames.is_active() {
+    let is_active = video_frames.is_active();
+    
+    // Debug: log every 300 frames to a file to ensure visibility
+    // Use a file that includes PID to avoid permission issues between greeter and user session
+    static CALL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let debug_file = format!("/tmp/video_debug_{}.log", std::process::id());
+    if count % 300 == 0 {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&debug_file)
+        {
+            let _ = writeln!(f, "update_video_texture #{}: output={}, is_active={}", count, output_name, is_active);
+        }
+    }
+    
+    if !is_active {
         return (None, false);
     }
 
     // Get frame data for this output
     let frame_data = match video_frames.get(&output_name) {
         Some(data) => data,
-        None => return (None, false),
+        None => {
+            if count % 300 == 0 {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&debug_file)
+                {
+                    let _ = writeln!(f, "update_video_texture #{}: NO frame data for output={}", count, output_name);
+                }
+            }
+            return (None, false);
+        }
     };
 
     let mut has_new_frame = false;
@@ -841,37 +871,41 @@ fn update_video_texture(
     let offset_x = (output_w - scaled_w) / 2.0;
     let offset_y = (output_h - scaled_h) / 2.0;
 
-    // Log video render info periodically
-    if has_new_frame && (*last_video_sequence <= 5 || *last_video_sequence % 120 == 0) {
-        let is_dmabuf = frame_data.is_dmabuf();
-        tracing::info!(
-            output = %output_name,
-            video = ?(video_w, video_h),
-            output_phys = ?(output_w, output_h),
-            output_scale,
-            render_scale = scale,
-            scaled = ?(scaled_w, scaled_h),
-            offset = ?(offset_x, offset_y),
-            frame_seq = *last_video_sequence,
-            dmabuf = is_dmabuf,
-            "Video render"
-        );
-    }
-
-    // Position in physical coordinates
+    // Log video render info periodically (write to file for visibility)
+    // Position in physical coordinates (TextureRenderElement expects Physical for location)
     let location = Point::<f64, Physical>::from((offset_x, offset_y));
 
     // Destination size - use physical size divided by output scale to get logical
-    // TextureRenderElement expects logical size for dst_size
+    // TextureRenderElement expects Logical for dst_size
     let dst_w = (scaled_w / output_scale) as i32;
     let dst_h = (scaled_h / output_scale) as i32;
     let dst_size = smithay::utils::Size::<i32, smithay::utils::Logical>::from((dst_w, dst_h));
+    
+    if has_new_frame && (*last_video_sequence <= 5 || *last_video_sequence % 300 == 0) {
+        let is_dmabuf = frame_data.is_dmabuf();
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&debug_file)
+        {
+            let _ = writeln!(f,
+                "VIDEO_SCALE: output={} video={}x{} output_phys={}x{} output_scale={:.2} render_scale={:.3} scaled={:.0}x{:.0} offset=({:.1},{:.1}) dst={}x{} seq={} dmabuf={}",
+                output_name, video_w, video_h, output_w, output_h, output_scale, scale, scaled_w, scaled_h, offset_x, offset_y, dst_w, dst_h, *last_video_sequence, is_dmabuf
+            );
+        }
+    }
+
+    // Source rectangle - full texture in buffer/logical coordinates with scale 1
+    let src_rect = smithay::utils::Rectangle::<f64, smithay::utils::Logical>::from_size(
+        (video_w, video_h).into()
+    );
 
     (Some(smithay::backend::renderer::element::texture::TextureRenderElement::from_texture_render_buffer(
         location,
         texture_buffer,
         Some(1.0), // alpha
-        None, // src - use full texture
+        Some(src_rect), // src - use full texture
         Some(dst_size), // destination size for scaling
         smithay::backend::renderer::element::Kind::Unspecified,
     )), has_new_frame)

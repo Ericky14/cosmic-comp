@@ -369,8 +369,17 @@ struct OutputVideo {
     shared_frame: SharedVideoFrame,
     /// Frame sequence counter
     frame_sequence: u64,
+    /// Last uploaded frame sequence (to avoid re-importing same frame)
+    last_uploaded_sequence: u64,
     /// Whether pipeline is using DMA-BUF output
     uses_dmabuf: bool,
+    /// Video framerate (fps) - used to optimize polling
+    video_fps: f64,
+    /// Last frame timestamp (nanoseconds) - reserved for future use
+    #[allow(dead_code)]
+    last_frame_time_ns: u64,
+    /// Frame interval in nanoseconds (1e9 / fps)
+    frame_interval_ns: u64,
 }
 
 /// Manages video wallpapers for all outputs.
@@ -732,7 +741,11 @@ impl VideoBackgroundManager {
             needs_upload: false,
             shared_frame,
             frame_sequence: 0,
+            last_uploaded_sequence: 0,
             uses_dmabuf: true,
+            video_fps: 0.0,
+            last_frame_time_ns: 0,
+            frame_interval_ns: 0,
         })
     }
 
@@ -798,7 +811,11 @@ impl VideoBackgroundManager {
                                     needs_upload: false,
                                     shared_frame,
                                     frame_sequence: 0,
+                                    last_uploaded_sequence: 0,
                                     uses_dmabuf: false,
+                                    video_fps: 0.0,
+                                    last_frame_time_ns: 0,
+                                    frame_interval_ns: 0,
                                 });
                             }
                         }
@@ -879,7 +896,11 @@ impl VideoBackgroundManager {
             needs_upload: false,
             shared_frame,
             frame_sequence: 0,
+            last_uploaded_sequence: 0,
             uses_dmabuf: false,
+            video_fps: 0.0,
+            last_frame_time_ns: 0,
+            frame_interval_ns: 0,
         })
     }
 
@@ -919,8 +940,8 @@ impl VideoBackgroundManager {
         }
 
         // Non-blocking pull - get frame if one is ready
-        // With sync=true, GStreamer releases frames at their PTS,
-        // so we get frames at the correct video timing
+        // With sync=true on appsink, GStreamer releases frames at their PTS,
+        // so we get frames at the correct video timing automatically
         let sample = match video.appsink.try_pull_sample(gst::ClockTime::ZERO) {
             Some(s) => s,
             None => return false,
@@ -947,6 +968,23 @@ impl VideoBackgroundManager {
 
         let width = video_info.width() as i32;
         let height = video_info.height() as i32;
+
+        // Extract framerate on first frame and set up polling interval
+        if video.video_fps == 0.0 {
+            let fps = video_info.fps();
+            if fps.numer() > 0 && fps.denom() > 0 {
+                let framerate = fps.numer() as f64 / fps.denom() as f64;
+                video.video_fps = framerate;
+                // Frame interval in nanoseconds
+                video.frame_interval_ns = (1_000_000_000.0 / framerate) as u64;
+
+                info!(
+                    framerate,
+                    frame_interval_ns = video.frame_interval_ns,
+                    "Video framerate detected, polling optimized"
+                );
+            }
+        }
 
         // Update video size if needed
         if video.video_size.is_none()
@@ -986,18 +1024,6 @@ impl VideoBackgroundManager {
         let width = video_info.width() as i32;
         let height = video_info.height() as i32;
         let n_planes = video_info.n_planes() as usize;
-
-        // Debug logging for first few frames
-        if video.frame_sequence <= 3 {
-            warn!(
-                width,
-                height,
-                n_planes,
-                format = ?video_info.format(),
-                n_memories = buffer.n_memory(),
-                "DMA-BUF frame debug"
-            );
-        }
 
         // For DMA_DRM format, the number of planes comes from buffer memories, not video_info
         let actual_n_planes = if n_planes == 0 {
@@ -1086,17 +1112,6 @@ impl VideoBackgroundManager {
                 (((width as u32) * 4 + 63) / 64) * 64
             };
 
-            if video.frame_sequence <= 3 {
-                warn!(
-                    plane_idx,
-                    offset,
-                    stride,
-                    mem_offset = memory.offset(),
-                    mem_size = memory.size(),
-                    "Plane info"
-                );
-            }
-
             planes.push(DmaBufPlane {
                 fd: std::sync::Arc::new(owned_fd),
                 offset,
@@ -1115,9 +1130,6 @@ impl VideoBackgroundManager {
             // Extract drm-format from caps
             if let Some(structure) = _caps.structure(0) {
                 let drm_format_result = structure.get::<&str>("drm-format");
-                if video.frame_sequence <= 3 {
-                    warn!(drm_format = ?drm_format_result, "Checking drm-format from caps");
-                }
                 if let Ok(drm_format) = drm_format_result {
                     match drm_format {
                         "AR24" | "XR24" => Fourcc::Argb8888,
@@ -1161,16 +1173,15 @@ impl VideoBackgroundManager {
 
         let size = Size::from((width, height));
 
-        if video.frame_sequence <= 3 || video.frame_sequence % 300 == 0 {
-            warn!(
+        // Log only the first frame for confirmation
+        if video.frame_sequence == 1 {
+            info!(
                 format = ?video_info.format(),
                 ?fourcc,
                 width,
                 height,
                 n_planes = planes.len(),
-                stride0 = planes[0].stride,
-                frame = video.frame_sequence,
-                "DMA-BUF frame SUCCESS"
+                "DMA-BUF video pipeline active"
             );
         }
 
@@ -1248,6 +1259,7 @@ impl VideoBackgroundManager {
     /// Get the texture buffer for an output, uploading new frame data if needed.
     ///
     /// Returns None if no video is configured or no frame is available.
+    /// Uses frame sequence tracking to avoid re-importing the same frame.
     pub fn get_texture_buffer<R>(
         &mut self,
         renderer: &mut R,
@@ -1265,9 +1277,17 @@ impl VideoBackgroundManager {
         // Check availability of new frame data
         let frame_data = video.shared_frame.get();
 
-        // Upload new texture if needed
-        if video.needs_upload || video.texture_buffer.is_none() {
+        // Check if we need to upload a new frame
+        // Skip if texture exists and frame sequence hasn't changed
+        let need_upload = if let Some(data) = &frame_data {
+            video.texture_buffer.is_none() || data.sequence != video.last_uploaded_sequence
+        } else {
+            video.texture_buffer.is_none()
+        };
+
+        if need_upload {
             if let Some(data) = frame_data {
+                let sequence = data.sequence;
                 match data.source {
                     VideoFrameSource::Cpu(pixels) => {
                         let size = data.size;
@@ -1285,8 +1305,8 @@ impl VideoBackgroundManager {
                                     Transform::Normal,
                                     None,
                                 ));
+                                video.last_uploaded_sequence = sequence;
                                 video.needs_upload = false;
-                                // debug!("Video texture uploaded (CPU)");
                             }
                             Err(e) => {
                                 warn!("Failed to import video texture (CPU): {:?}", e);
@@ -1331,8 +1351,8 @@ impl VideoBackgroundManager {
                                     Transform::Normal,
                                     None,
                                 ));
+                                video.last_uploaded_sequence = sequence;
                                 video.needs_upload = false;
-                                // debug!("Video texture uploaded (DMA-BUF)");
                             }
                             Err(e) => {
                                 warn!("Failed to import video texture (DMA-BUF): {:?}", e);
@@ -1353,17 +1373,29 @@ impl VideoBackgroundManager {
     /// Get a render element for an output's video background.
     ///
     /// This method uploads the frame if needed and returns a TextureRenderElement
-    /// positioned at (0, 0) suitable for rendering as a background.
+    /// positioned to cover the output. The video is scaled to fill the output
+    /// while maintaining aspect ratio (zoom/cover mode), with any overflow cropped.
     ///
     /// Returns None if no video is configured or no frame is available.
     pub fn get_render_element<R>(
         &mut self,
         renderer: &mut R,
         output_name: &str,
+        output_size: Size<i32, Physical>,
     ) -> Option<TextureRenderElement<GlesTexture>>
     where
         R: Renderer<TextureId = GlesTexture> + ImportMem + ImportDma,
     {
+        // Log entry to function
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/video-scaling.log")
+        {
+            let _ = writeln!(f, "get_render_element called for output={} size={}x{}", output_name, output_size.w, output_size.h);
+        }
+
         // First ensure texture is uploaded
         let _ = self.get_texture_buffer(renderer, output_name)?;
 
@@ -1375,14 +1407,69 @@ impl VideoBackgroundManager {
         };
 
         let texture_buffer = video.texture_buffer.as_ref()?;
+        let video_size = video.video_size?;
 
-        // Create render element at position (0, 0)
+        // Calculate scaling to cover the output while maintaining aspect ratio
+        // This is "zoom" mode - video fills output, cropping if needed
+        let output_w = output_size.w as f64;
+        let output_h = output_size.h as f64;
+        let video_w = video_size.w as f64;
+        let video_h = video_size.h as f64;
+
+        // Scale factor to cover (use the larger scale)
+        let scale_x = output_w / video_w;
+        let scale_y = output_h / video_h;
+        let scale = scale_x.max(scale_y);
+
+        // Calculate scaled video dimensions
+        let scaled_w = (video_w * scale) as i32;
+        let scaled_h = (video_h * scale) as i32;
+
+        // Center the video (may be negative if video is larger than output)
+        let offset_x = (output_size.w - scaled_w) / 2;
+        let offset_y = (output_size.h - scaled_h) / 2;
+
+        // Log dimensions for debugging - write to file since journal may filter
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/video-scaling.log")
+        {
+            let _ = writeln!(
+                f,
+                "output={} output_size={}x{} video_size={}x{} scale_x={:.3} scale_y={:.3} scale={:.3} scaled={}x{} offset=({},{})",
+                output_name,
+                output_size.w, output_size.h,
+                video_size.w, video_size.h,
+                scale_x, scale_y, scale,
+                scaled_w, scaled_h,
+                offset_x, offset_y
+            );
+        }
+
+        info!(
+            output = output_name,
+            output_w = output_size.w,
+            output_h = output_size.h,
+            video_w = video_size.w,
+            video_h = video_size.h,
+            scale_x = %format!("{:.3}", scale_x),
+            scale_y = %format!("{:.3}", scale_y),
+            scale = %format!("{:.3}", scale),
+            scaled_w,
+            scaled_h,
+            offset_x,
+            offset_y,
+            "Video scaling calculated"
+        );
+
+        // Create render element with scaled size and centered position
         Some(TextureRenderElement::from_texture_buffer(
-            Point::from((0.0, 0.0)),
+            Point::from((offset_x as f64, offset_y as f64)),
             texture_buffer,
             None, // no alpha override
-            None, // no src rect
-            None, // no size override
+            None, // use full texture as source
+            Some(Size::from((scaled_w, scaled_h))), // scale to cover output
             smithay::backend::renderer::element::Kind::Unspecified,
         ))
     }

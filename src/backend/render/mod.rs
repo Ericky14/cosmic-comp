@@ -1572,12 +1572,26 @@ where
     CosmicMappedRenderElement<R>: RenderElement<R>,
 {
     let output_name = output.name();
+    let output_size = output
+        .current_mode()
+        .map(|m| m.size)
+        .unwrap_or_else(|| smithay::utils::Size::from((1920, 1080)));
+
+    // Log to file for debugging
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/video-scaling.log")
+    {
+        let _ = writeln!(f, "video_background_element: output={} size={}x{}", output_name, output_size.w, output_size.h);
+    }
 
     // Poll for new frames
     video_manager.poll_frames();
 
-    // Get the render element from the video manager
-    let texture_element = video_manager.get_render_element(renderer, &output_name)?;
+    // Get the render element from the video manager, scaled to output size
+    let texture_element = video_manager.get_render_element(renderer, &output_name, output_size)?;
 
     Some(CosmicElement::VideoBackground(texture_element))
 }
