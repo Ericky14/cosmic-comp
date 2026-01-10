@@ -74,7 +74,7 @@ rpm: all
 	@echo "Building RPM for $(BINARY) version $(VERSION)..."
 	rm -rf "$(RPM_ROOT)" "$(RPM_BUILD)"
 	mkdir -p "$(RPM_ROOT)" "$(RPM_BUILD)"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
-	COSMIC_COMP_SOURCE="$(CURDIR)" rpmbuild -bb --nodeps \
+	COSMIC_COMP_SOURCE="$(CURDIR)" COSMIC_COMP_VERSION="$(VERSION)" rpmbuild -bb --nodeps \
 		--define "_topdir $(CURDIR)/$(RPM_BUILD)" \
 		--define "_binary_payload w2.xzdio" \
 		--buildroot "$(CURDIR)/$(RPM_ROOT)" \
