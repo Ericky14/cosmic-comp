@@ -1,6 +1,6 @@
 Name:           cosmic-comp
 Epoch:          1
-Version:        1.0.0
+Version:        %{getenv:COSMIC_COMP_VERSION}
 Release:        1%{?dist}
 Summary:        COSMIC Wayland Compositor (Playtron fork)
 
@@ -9,12 +9,18 @@ URL:            https://github.com/pop-os/cosmic-comp
 
 # No BuildRequires - binary is pre-built
 
+# Runtime dependencies (from upstream cosmic-comp)
+# Pin cosmic-icon-theme to 1.0.x series
+Requires:       (cosmic-icon-theme >= 1.0.0 with cosmic-icon-theme < 1.1.0)
 Requires:       mesa-libEGL
 Requires:       libwayland-server
 Requires:       libinput
 Requires:       libseat
 Requires:       libxkbcommon
 Requires:       mesa-libgbm
+Requires:       libdisplay-info
+Requires:       pixman
+Requires:       systemd-udev
 
 # Override the upstream cosmic-comp from cosmic-desktop
 Provides:       cosmic-comp = %{epoch}:%{version}-%{release}
