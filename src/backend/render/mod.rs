@@ -125,7 +125,7 @@ pub static ACTIVE_GROUP_COLOR: [f32; 3] = [0.58, 0.922, 0.922];
 /// Default blur radius in pixels (design spec: blur(50px))
 pub const DEFAULT_BLUR_RADIUS: f32 = 50.0;
 /// Number of blur iterations for stronger effect
-pub const BLUR_ITERATIONS: u32 = 2;
+pub const BLUR_ITERATIONS: u32 = 4;
 
 use once_cell::sync::Lazy;
 /// Global cache for blurred textures per output

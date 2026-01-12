@@ -26,7 +26,8 @@ use smithay::{
 use crate::{
     backend::render::{
         BackdropShader, BlurredBackdropShader, IndicatorShader, Key, Usage,
-        element::AsGlowRenderer, get_cached_blur_texture, is_window_grabbed, should_skip_blur_backdrops,
+        element::AsGlowRenderer, get_cached_blur_texture, is_window_grabbed,
+        should_skip_blur_backdrops,
     },
     shell::{
         CosmicSurface, Direction, ManagedLayer, MoveResult, ResizeMode,
@@ -1804,7 +1805,11 @@ impl FloatingLayout {
         // Debug: Log how many windows are in the space during blur capture
         if should_skip_blur_backdrops() {
             let window_count = self.space.elements().count();
-            let window_list: Vec<_> = self.space.elements().map(|e| e.active_window().app_id()).collect();
+            let window_list: Vec<_> = self
+                .space
+                .elements()
+                .map(|e| e.active_window().app_id())
+                .collect();
             tracing::debug!(
                 window_count = window_count,
                 windows = ?window_list,
@@ -1968,6 +1973,7 @@ impl FloatingLayout {
                 if let Some(blur_info) = get_cached_blur_texture(&output_name) {
                     tracing::debug!(
                         output = %output_name,
+                        window_elements_before = window_elements.len(),
                         geometry_x = geometry.loc.x,
                         geometry_y = geometry.loc.y,
                         geometry_w = geometry.size.w,
@@ -1978,6 +1984,7 @@ impl FloatingLayout {
                         "Creating BlurredBackdropShader element"
                     );
                     // Use BlurredBackdropShader with the cached blurred texture
+                    // CSS equivalent: background: rgba(255, 255, 255, 0.10); backdrop-filter: blur(50px);
                     let blur_backdrop = BlurredBackdropShader::element(
                         renderer,
                         &blur_info.texture,
@@ -1986,13 +1993,17 @@ impl FloatingLayout {
                         output.current_scale().fractional_scale(),
                         output.current_transform(),
                         corner_radius,
-                        alpha * 0.95, // DEBUG: High opacity to verify blur is rendering
+                        alpha,           // Full alpha (window controls visibility)
                         [1.0, 1.0, 1.0], // White tint
-                        0.3,          // DEBUG: Higher tint to make more visible
+                        0.10,            // 10% tint strength (rgba 0.10)
                     );
-                    // DEBUG: Render blur backdrop on TOP to verify it's working
-                    // TODO: Change to insert(0) once verified
+                    // Push to end = renders first (in back), window content renders on top
+                    // Smithay renders elements in reverse order: last element = back, first = front
                     window_elements.push(blur_backdrop.into());
+                    tracing::debug!(
+                        window_elements_after = window_elements.len(),
+                        "Pushed blur backdrop to back"
+                    );
                 } else {
                     tracing::debug!(
                         output = %output_name,
@@ -2007,7 +2018,8 @@ impl FloatingLayout {
                         alpha * 0.25, // 25% opacity (more visible since blur isn't available)
                         [0.9, 0.9, 0.95], // Slightly tinted white for frosted look
                     );
-                    window_elements.insert(0, blur_backdrop.into());
+                    // Push to end = renders first (in back), window content renders on top
+                    window_elements.push(blur_backdrop.into());
                 }
             }
 
