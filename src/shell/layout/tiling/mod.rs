@@ -5517,6 +5517,21 @@ where
                     )
                 }
 
+                // Add blur backdrop for windows that request KDE blur
+                if mapped.has_blur() {
+                    elements.insert(
+                        0,
+                        CosmicMappedRenderElement::Overlay(BackdropShader::element(
+                            renderer,
+                            Key::Window(Usage::Overlay, mapped.key()),
+                            geo,
+                            8.0, // Corner radius
+                            alpha * 0.7,
+                            [0.1, 0.1, 0.1],
+                        )),
+                    );
+                }
+
                 let (behavior, align) = if is_overview {
                     (ConstrainScaleBehavior::Fit, ConstrainAlign::CENTER)
                 } else if animating {

@@ -75,6 +75,7 @@ use smithay::{
 use smithay_egui::EguiState;
 
 pub mod animations;
+pub mod blur;
 
 pub mod cursor;
 pub mod element;
@@ -115,8 +116,515 @@ pub static CLEAR_COLOR: Color32F = Color32F::new(0.153, 0.161, 0.165, 1.0);
 pub static OUTLINE_SHADER: &str = include_str!("./shaders/rounded_outline.frag");
 pub static RECTANGLE_SHADER: &str = include_str!("./shaders/rounded_rectangle.frag");
 pub static POSTPROCESS_SHADER: &str = include_str!("./shaders/offscreen.frag");
+pub static BLUR_SHADER: &str = include_str!("./shaders/blur.frag");
+pub static SHADOW_SHADER: &str = include_str!("./shaders/shadow.frag");
+pub static BLURRED_BACKDROP_SHADER: &str = include_str!("./shaders/blurred_backdrop.frag");
 pub static GROUP_COLOR: [f32; 3] = [0.788, 0.788, 0.788];
 pub static ACTIVE_GROUP_COLOR: [f32; 3] = [0.58, 0.922, 0.922];
+
+/// Default blur radius in pixels (design spec: blur(50px))
+pub const DEFAULT_BLUR_RADIUS: f32 = 50.0;
+/// Number of blur iterations for stronger effect
+pub const BLUR_ITERATIONS: u32 = 2;
+
+use once_cell::sync::Lazy;
+/// Global cache for blurred textures per output
+///
+/// This cache allows the blur render path to store blurred textures
+/// that can be read by the floating layout renderer.
+/// Key is the output name (String), value is the blurred texture.
+use std::sync::RwLock;
+
+/// Blurred texture data for an output
+#[derive(Debug, Clone)]
+pub struct BlurredTextureInfo {
+    /// The blurred texture buffer
+    pub texture: TextureRenderBuffer<GlesTexture>,
+    /// Size of the texture
+    pub size: Size<i32, Physical>,
+    /// Scale factor
+    pub scale: Scale<f64>,
+}
+
+/// Global cache of blurred textures per output
+pub static BLUR_TEXTURE_CACHE: Lazy<RwLock<HashMap<String, BlurredTextureInfo>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Global flag to skip blur backdrops during background capture
+/// When true, floating_layout.render() should skip adding blur backdrop elements
+pub static SKIP_BLUR_BACKDROPS: AtomicBool = AtomicBool::new(false);
+
+/// Check if blur backdrops should be skipped
+pub fn should_skip_blur_backdrops() -> bool {
+    SKIP_BLUR_BACKDROPS.load(Ordering::Relaxed)
+}
+
+/// Set whether blur backdrops should be skipped
+pub fn set_skip_blur_backdrops(skip: bool) {
+    SKIP_BLUR_BACKDROPS.store(skip, Ordering::Relaxed);
+}
+
+use crate::shell::element::CosmicMapped;
+
+thread_local! {
+    /// Window currently being grabbed/moved - should be excluded from blur capture
+    static GRABBED_WINDOW: RefCell<Option<CosmicMapped>> = const { RefCell::new(None) };
+}
+
+/// Set the currently grabbed window (for blur exclusion)
+pub fn set_grabbed_window(window: Option<CosmicMapped>) {
+    GRABBED_WINDOW.with(|w| {
+        if window.is_some() {
+            tracing::debug!("Setting grabbed window for blur exclusion");
+        }
+        *w.borrow_mut() = window;
+    });
+}
+
+/// Check if a window is currently being grabbed/moved
+pub fn is_window_grabbed(window: &CosmicMapped) -> bool {
+    GRABBED_WINDOW.with(|w| {
+        let borrowed = w.borrow();
+        if let Some(ref grabbed) = *borrowed {
+            // Log the comparison to debug why it might not match
+            let matched = grabbed == window;
+            if !matched {
+                // Debug: Log the window class names to see if they're the same window
+                let grabbed_class = grabbed.active_window().app_id();
+                let window_class = window.active_window().app_id();
+                tracing::debug!(
+                    grabbed_class = %grabbed_class,
+                    window_class = %window_class,
+                    "Grabbed window comparison - not matching"
+                );
+            } else {
+                tracing::debug!("Window is grabbed - excluding from blur capture");
+            }
+            matched
+        } else {
+            false
+        }
+    })
+}
+
+/// Store a blurred texture for an output
+pub fn cache_blur_texture(output_name: &str, info: BlurredTextureInfo) {
+    if let Ok(mut cache) = BLUR_TEXTURE_CACHE.write() {
+        cache.insert(output_name.to_string(), info);
+    }
+}
+
+/// Get the cached blurred texture for an output
+pub fn get_cached_blur_texture(output_name: &str) -> Option<BlurredTextureInfo> {
+    if let Ok(cache) = BLUR_TEXTURE_CACHE.read() {
+        cache.get(output_name).cloned()
+    } else {
+        None
+    }
+}
+
+/// Clear the blur texture cache for an output
+#[allow(dead_code)]
+pub fn clear_blur_texture(output_name: &str) {
+    if let Ok(mut cache) = BLUR_TEXTURE_CACHE.write() {
+        cache.remove(output_name);
+    }
+}
+
+/// State for managing blur effect rendering per-output
+///
+/// Blur requires rendering background content to an offscreen texture,
+/// applying a two-pass gaussian blur (horizontal + vertical), then
+/// compositing the result behind the target surface.
+///
+/// This implementation uses a "previous frame" approach where the blur
+/// source is the previous frame's content, avoiding the need to render
+/// the scene twice per frame.
+#[derive(Debug)]
+pub struct BlurRenderState {
+    /// Texture containing the previous frame's content (used as blur source)
+    pub background_texture: Option<TextureRenderBuffer<GlesTexture>>,
+    /// Offscreen texture for blur passes (ping)
+    pub texture_a: Option<TextureRenderBuffer<GlesTexture>>,
+    /// Offscreen texture for blur passes (pong)
+    pub texture_b: Option<TextureRenderBuffer<GlesTexture>>,
+    /// Damage tracker for the blur textures
+    pub damage_tracker: Option<OutputDamageTracker>,
+    /// Size of the blur textures
+    pub texture_size: Size<i32, Physical>,
+    /// Scale factor
+    pub scale: Scale<f64>,
+    /// Whether blur has been applied this frame
+    pub blur_applied: bool,
+}
+
+impl Default for BlurRenderState {
+    fn default() -> Self {
+        Self {
+            background_texture: None,
+            texture_a: None,
+            texture_b: None,
+            damage_tracker: None,
+            texture_size: Size::from((0, 0)),
+            scale: Scale::from(1.0),
+            blur_applied: false,
+        }
+    }
+}
+
+impl BlurRenderState {
+    /// Create or resize blur textures if needed
+    pub fn ensure_textures<R: AsGlowRenderer + Offscreen<GlesTexture>>(
+        &mut self,
+        renderer: &mut R,
+        format: Fourcc,
+        size: Size<i32, Physical>,
+        scale: Scale<f64>,
+    ) -> Result<(), R::Error> {
+        // Only recreate if size changed
+        if self.texture_size == size
+            && self.texture_a.is_some()
+            && self.texture_b.is_some()
+            && self.background_texture.is_some()
+        {
+            return Ok(());
+        }
+
+        let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+
+        // Create background texture (stores previous frame for blur source)
+        let bg_tex = Offscreen::<GlesTexture>::create_buffer(renderer, format, buffer_size)?;
+        self.background_texture = Some(TextureRenderBuffer::from_texture(
+            renderer.glow_renderer(),
+            bg_tex,
+            1,
+            Transform::Normal,
+            None,
+        ));
+
+        // Create texture A (ping)
+        let tex_a = Offscreen::<GlesTexture>::create_buffer(renderer, format, buffer_size)?;
+        self.texture_a = Some(TextureRenderBuffer::from_texture(
+            renderer.glow_renderer(),
+            tex_a,
+            1,
+            Transform::Normal,
+            None,
+        ));
+
+        // Create texture B (pong)
+        let tex_b = Offscreen::<GlesTexture>::create_buffer(renderer, format, buffer_size)?;
+        self.texture_b = Some(TextureRenderBuffer::from_texture(
+            renderer.glow_renderer(),
+            tex_b,
+            1,
+            Transform::Normal,
+            None,
+        ));
+
+        // Create damage tracker
+        self.damage_tracker = Some(OutputDamageTracker::new(size, scale, Transform::Normal));
+
+        self.texture_size = size;
+        self.scale = scale;
+        self.blur_applied = false;
+        Ok(())
+    }
+
+    /// Get background texture (previous frame content)
+    pub fn background_texture(&self) -> Option<&TextureRenderBuffer<GlesTexture>> {
+        self.background_texture.as_ref()
+    }
+
+    /// Get texture A for rendering
+    pub fn texture_a(&self) -> Option<&TextureRenderBuffer<GlesTexture>> {
+        self.texture_a.as_ref()
+    }
+
+    /// Get texture B for rendering
+    pub fn texture_b(&self) -> Option<&TextureRenderBuffer<GlesTexture>> {
+        self.texture_b.as_ref()
+    }
+
+    /// Check if blur state is ready for rendering
+    pub fn is_ready(&self) -> bool {
+        self.background_texture.is_some() && self.texture_a.is_some() && self.texture_b.is_some()
+    }
+
+    /// Create blurred texture elements for the specified blur regions
+    ///
+    /// This method returns texture elements for blur regions.
+    /// The caller should:
+    /// 1. First render the scene to background_texture
+    /// 2. Call apply_blur_passes() to blur into texture_b
+    /// 3. Then call create_blur_elements() to get blurred texture elements
+    /// 4. Render those elements at blur window locations
+    ///
+    /// This uses texture_b as the source since that's where the blurred result is stored
+    /// after apply_blur_passes().
+    pub fn create_blur_elements(
+        &self,
+        blur_regions: &[BlurRegionInfo],
+    ) -> Vec<TextureRenderElement<GlesTexture>> {
+        if !self.is_ready() || blur_regions.is_empty() {
+            tracing::warn!("create_blur_elements: not ready or no regions");
+            return Vec::new();
+        }
+
+        let tex_size = self.texture_size;
+        let mut elements = Vec::new();
+
+        // Use texture_b as the source - it contains the blurred result after apply_blur_passes()
+        // Falls back to background_texture if blur hasn't been applied
+        let source_texture = if self.blur_applied {
+            tracing::info!("Using texture_b (blurred result)");
+            self.texture_b.as_ref()
+        } else {
+            tracing::info!("Using background_texture (fallback, blur not applied)");
+            self.background_texture.as_ref()
+        };
+
+        let Some(blurred_texture) = source_texture else {
+            tracing::warn!("No source texture available");
+            return elements;
+        };
+
+        for region in blur_regions {
+            let phys_geo: Rectangle<i32, Physical> = region
+                .geometry
+                .as_logical()
+                .to_physical_precise_round(self.scale.x);
+
+            // Calculate source region in the texture (normalized to texture size)
+            let src_rect = Rectangle::<f64, Logical>::new(
+                (
+                    phys_geo.loc.x as f64 / tex_size.w as f64,
+                    phys_geo.loc.y as f64 / tex_size.h as f64,
+                )
+                    .into(),
+                (
+                    phys_geo.size.w as f64 / tex_size.w as f64,
+                    phys_geo.size.h as f64 / tex_size.h as f64,
+                )
+                    .into(),
+            );
+
+            tracing::info!(
+                phys_geo_x = phys_geo.loc.x,
+                phys_geo_y = phys_geo.loc.y,
+                phys_geo_w = phys_geo.size.w,
+                phys_geo_h = phys_geo.size.h,
+                src_rect_x = src_rect.loc.x,
+                src_rect_y = src_rect.loc.y,
+                src_rect_w = src_rect.size.w,
+                src_rect_h = src_rect.size.h,
+                tex_size_w = tex_size.w,
+                tex_size_h = tex_size.h,
+                alpha = region.alpha,
+                "Creating blur element"
+            );
+
+            let elem = TextureRenderElement::from_texture_render_buffer(
+                Point::<f64, Physical>::from((phys_geo.loc.x as f64, phys_geo.loc.y as f64)),
+                blurred_texture,
+                Some(region.alpha),
+                Some(src_rect),
+                None,
+                Kind::Unspecified,
+            );
+
+            elements.push(elem);
+        }
+
+        elements
+    }
+}
+
+/// Apply two-pass Gaussian blur using ping-pong rendering
+///
+/// - `renderer`: The renderer to use
+/// - `src_texture`: Source texture to blur (will not be modified)
+/// - `ping_texture`: First intermediate texture
+/// - `pong_texture`: Second intermediate texture (will contain final result)
+/// - `tex_size`: Size of all textures
+/// - `scale`: Scale factor for damage tracking
+/// - `iterations`: Number of blur iterations
+///
+/// After this function, `pong_texture` contains the blurred result.
+#[allow(dead_code)]
+pub fn apply_blur_passes<R>(
+    renderer: &mut R,
+    src_texture: &TextureRenderBuffer<GlesTexture>,
+    ping_texture: &mut TextureRenderBuffer<GlesTexture>,
+    pong_texture: &mut TextureRenderBuffer<GlesTexture>,
+    tex_size: Size<i32, Physical>,
+    scale: Scale<f64>,
+    iterations: u32,
+) -> Result<(), GlesError>
+where
+    R: Renderer + Bind<Dmabuf> + Offscreen<GlesTexture> + AsGlowRenderer,
+    R::TextureId: Send + Clone + 'static,
+{
+    let blur_shader = BlurShader::get(renderer);
+    let blur_radius = DEFAULT_BLUR_RADIUS;
+
+    // First pass: src -> ping (horizontal blur)
+    apply_single_blur_pass(
+        renderer,
+        src_texture,
+        ping_texture,
+        &blur_shader,
+        blur_radius,
+        tex_size,
+        scale,
+        true,
+    )?;
+
+    // Second pass: ping -> pong (vertical blur)
+    apply_single_blur_pass(
+        renderer,
+        ping_texture,
+        pong_texture,
+        &blur_shader,
+        blur_radius,
+        tex_size,
+        scale,
+        false,
+    )?;
+
+    // Additional iterations for smoother blur
+    for _ in 1..iterations {
+        // Horizontal: pong -> ping
+        apply_single_blur_pass(
+            renderer,
+            pong_texture,
+            ping_texture,
+            &blur_shader,
+            blur_radius,
+            tex_size,
+            scale,
+            true,
+        )?;
+
+        // Vertical: ping -> pong
+        apply_single_blur_pass(
+            renderer,
+            ping_texture,
+            pong_texture,
+            &blur_shader,
+            blur_radius,
+            tex_size,
+            scale,
+            false,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Apply a single blur pass from src to dst
+#[allow(dead_code)]
+fn apply_single_blur_pass<R>(
+    renderer: &mut R,
+    src_texture: &TextureRenderBuffer<GlesTexture>,
+    dst_texture: &mut TextureRenderBuffer<GlesTexture>,
+    blur_shader: &GlesTexProgram,
+    blur_radius: f32,
+    tex_size: Size<i32, Physical>,
+    _scale: Scale<f64>,
+    horizontal: bool,
+) -> Result<(), GlesError>
+where
+    R: Renderer + Bind<Dmabuf> + Offscreen<GlesTexture> + AsGlowRenderer,
+    R::TextureId: Send + Clone + 'static,
+{
+    tracing::debug!(
+        horizontal = horizontal,
+        blur_radius = blur_radius,
+        tex_size_w = tex_size.w,
+        tex_size_h = tex_size.h,
+        "Applying single blur pass"
+    );
+
+    let src_elem = TextureRenderElement::from_texture_render_buffer(
+        Point::<f64, Physical>::from((0.0, 0.0)),
+        src_texture,
+        Some(1.0),
+        None,
+        None,
+        Kind::Unspecified,
+    );
+
+    let blur_elem = TextureShaderElement::new(
+        src_elem,
+        blur_shader.clone(),
+        vec![
+            Uniform::new("tex_size", [tex_size.w as f32, tex_size.h as f32]),
+            Uniform::new("blur_radius", blur_radius),
+            Uniform::new("direction", if horizontal { 0.0 } else { 1.0 }),
+        ],
+    );
+
+    dst_texture.render().draw::<_, GlesError>(|tex| {
+        let glow = renderer.glow_renderer_mut();
+        let mut target = glow.bind(tex)?;
+
+        // Get a frame to render with
+        use smithay::backend::renderer::Renderer as RendererTrait;
+        let mut frame = glow.render(&mut target, tex_size, Transform::Normal)?;
+
+        // Clear the framebuffer first
+        use smithay::backend::renderer::Color32F;
+        use smithay::backend::renderer::Frame;
+        let clear_damage = [Rectangle::from_size(tex_size)];
+        frame.clear(Color32F::from([0.0, 0.0, 0.0, 0.0]), &clear_damage)?;
+
+        // Render the blur element using the RenderElement trait
+        use smithay::backend::renderer::element::RenderElement;
+        use smithay::backend::renderer::glow::GlowRenderer;
+        use smithay::utils::Buffer as BufferCoords;
+
+        // Source: full texture in buffer coordinates
+        let src: Rectangle<f64, BufferCoords> =
+            Rectangle::from_size((tex_size.w as f64, tex_size.h as f64).into());
+        // Destination: full output in physical coordinates
+        let dst: Rectangle<i32, Physical> = Rectangle::from_size(tex_size);
+        let damage = [dst];
+
+        <TextureShaderElement as RenderElement<GlowRenderer>>::draw(
+            &blur_elem,
+            &mut frame,
+            src,
+            dst,
+            &damage,
+            &[],
+        )?;
+
+        // Finish the frame
+        drop(frame);
+
+        tracing::debug!(horizontal = horizontal, "Blur pass render completed");
+
+        // Return damage in buffer coordinates
+        let buffer_size: Size<i32, Logical> = tex_size.to_logical(1);
+        let damage_rect = Rectangle::from_size(tex_size);
+        Ok(vec![damage_rect.to_logical(1).to_buffer(
+            1,
+            Transform::Normal,
+            &buffer_size,
+        )])
+    })?;
+
+    Ok(())
+}
+
+/// Shader for applying blur effects to surfaces
+pub struct BlurShader(pub GlesTexProgram);
+
+/// Shader for rendering blurred backdrop (samples from pre-blurred texture)
+pub struct BlurredBackdropShader(pub GlesTexProgram);
 
 pub struct IndicatorShader(pub GlesPixelProgram);
 
@@ -365,7 +873,322 @@ impl BackdropShader {
     }
 }
 
+pub struct ShadowShader(pub GlesPixelProgram);
+
+#[derive(PartialEq)]
+struct ShadowSettings {
+    shadow_radius: f32,
+    shadow_blur: f32,
+    shadow_offset: [f32; 2],
+    alpha: f32,
+    color: [f32; 3],
+}
+type ShadowCache = RefCell<HashMap<Key, (ShadowSettings, PixelShaderElement)>>;
+
+impl ShadowShader {
+    pub fn get<R: AsGlowRenderer>(renderer: &R) -> GlesPixelProgram {
+        Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+            .egl_context()
+            .user_data()
+            .get::<ShadowShader>()
+            .expect("ShadowShader not initialized")
+            .0
+            .clone()
+    }
+
+    /// Create a shadow element for blur windows
+    ///
+    /// - `geo`: The geometry of the shadow element (should be larger than the window by `blur` on each side)
+    /// - `corner_radius`: Corner radius of the window
+    /// - `blur`: Shadow blur spread in pixels
+    /// - `offset`: Shadow offset (x, y)
+    /// - `alpha`: Overall alpha
+    /// - `color`: Shadow color RGB
+    pub fn element<R: AsGlowRenderer>(
+        renderer: &R,
+        key: impl Into<Key>,
+        geo: Rectangle<i32, Local>,
+        corner_radius: f32,
+        blur: f32,
+        offset: [f32; 2],
+        alpha: f32,
+        color: [f32; 3],
+    ) -> PixelShaderElement {
+        let settings = ShadowSettings {
+            shadow_radius: corner_radius,
+            shadow_blur: blur,
+            shadow_offset: offset,
+            alpha,
+            color,
+        };
+
+        let user_data = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+            .egl_context()
+            .user_data();
+
+        user_data.insert_if_missing(|| ShadowCache::new(HashMap::new()));
+        let mut cache = user_data.get::<ShadowCache>().unwrap().borrow_mut();
+        cache.retain(|k, _| match k {
+            Key::Static(w) => w.upgrade().is_some(),
+            Key::Group(a) => a.upgrade().is_some(),
+            Key::Window(_, w) => w.alive(),
+        });
+
+        let key = key.into();
+        if cache
+            .get(&key)
+            .filter(|(old_settings, _)| &settings == old_settings)
+            .is_none()
+        {
+            let shader = Self::get(renderer);
+
+            let elem = PixelShaderElement::new(
+                shader,
+                geo.as_logical(),
+                None,
+                alpha,
+                vec![
+                    Uniform::new("shadow_color", color),
+                    Uniform::new("shadow_radius", corner_radius),
+                    Uniform::new("shadow_blur", blur),
+                    Uniform::new("shadow_offset", offset),
+                ],
+                Kind::Unspecified,
+            );
+            cache.insert(key.clone(), (settings, elem));
+        }
+
+        let elem = &mut cache.get_mut(&key).unwrap().1;
+        if elem.geometry(1.0.into()).to_logical(1) != geo.as_logical() {
+            elem.resize(geo.as_logical(), None);
+        }
+        elem.clone()
+    }
+}
+
 pub struct PostprocessShader(pub GlesTexProgram);
+
+impl BlurShader {
+    /// Get the blur shader program
+    pub fn get<R: AsGlowRenderer>(renderer: &R) -> GlesTexProgram {
+        Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+            .egl_context()
+            .user_data()
+            .get::<BlurShader>()
+            .expect("Custom Shaders not initialized")
+            .0
+            .clone()
+    }
+
+    /// Create a horizontal blur pass element from a texture
+    ///
+    /// The blur shader requires two passes (horizontal + vertical) for proper gaussian blur.
+    /// This creates the horizontal pass. The output should be rendered to an intermediate
+    /// texture, then `element_vertical` should be called on that result.
+    pub fn element_horizontal<R: AsGlowRenderer>(
+        renderer: &R,
+        texture_elem: TextureRenderElement<GlesTexture>,
+        blur_radius: f32,
+    ) -> TextureShaderElement {
+        let shader = Self::get(renderer);
+        let geo = texture_elem.geometry(1.0.into());
+
+        TextureShaderElement::new(
+            texture_elem,
+            shader,
+            vec![
+                Uniform::new("tex_size", [geo.size.w as f32, geo.size.h as f32]),
+                Uniform::new("blur_radius", blur_radius),
+                Uniform::new("direction", 0.0), // 0.0 = horizontal
+            ],
+        )
+    }
+
+    /// Create a vertical blur pass element from a texture
+    ///
+    /// This should be called on the output of `element_horizontal` for proper
+    /// two-pass gaussian blur.
+    pub fn element_vertical<R: AsGlowRenderer>(
+        renderer: &R,
+        texture_elem: TextureRenderElement<GlesTexture>,
+        blur_radius: f32,
+    ) -> TextureShaderElement {
+        let shader = Self::get(renderer);
+        let geo = texture_elem.geometry(1.0.into());
+
+        TextureShaderElement::new(
+            texture_elem,
+            shader,
+            vec![
+                Uniform::new("tex_size", [geo.size.w as f32, geo.size.h as f32]),
+                Uniform::new("blur_radius", blur_radius),
+                Uniform::new("direction", 1.0), // 1.0 = vertical
+            ],
+        )
+    }
+
+    /// Create a single-pass blur element (simplified blur for performance)
+    ///
+    /// For a proper gaussian blur, two passes (horizontal + vertical) are needed.
+    /// This creates a single-pass blur which is faster but lower quality.
+    /// Use `element_horizontal` followed by `element_vertical` for better quality.
+    pub fn element_single_pass<R: AsGlowRenderer>(
+        renderer: &R,
+        texture_elem: TextureRenderElement<GlesTexture>,
+        blur_radius: f32,
+        horizontal: bool,
+    ) -> TextureShaderElement {
+        let shader = Self::get(renderer);
+        let geo = texture_elem.geometry(1.0.into());
+
+        TextureShaderElement::new(
+            texture_elem,
+            shader,
+            vec![
+                Uniform::new("tex_size", [geo.size.w as f32, geo.size.h as f32]),
+                Uniform::new("blur_radius", blur_radius),
+                Uniform::new("direction", if horizontal { 0.0 } else { 1.0 }),
+            ],
+        )
+    }
+}
+
+impl BlurredBackdropShader {
+    /// Get the blurred backdrop shader program
+    pub fn get<R: AsGlowRenderer>(renderer: &R) -> GlesTexProgram {
+        Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+            .egl_context()
+            .user_data()
+            .get::<BlurredBackdropShader>()
+            .expect("BlurredBackdropShader not initialized")
+            .0
+            .clone()
+    }
+
+    /// Create a blurred backdrop element from a pre-blurred texture
+    ///
+    /// This crops the correct region from the blurred background texture,
+    /// applies a tint overlay, and masks with rounded corners.
+    ///
+    /// # Arguments
+    /// * `renderer` - The renderer to use
+    /// * `blurred_texture` - The pre-blurred background texture (full screen)
+    /// * `element_geo` - The geometry of the element (where the backdrop appears)
+    /// * `screen_size` - The full screen size for coordinate mapping
+    /// * `scale` - Output scale factor for coordinate conversion
+    /// * `transform` - Output transform for coordinate conversion
+    /// * `corner_radius` - Corner radius for rounded rectangle mask
+    /// * `alpha` - Overall opacity
+    /// * `tint_color` - Tint overlay color
+    /// * `tint_strength` - How much tint to apply (0.0 = none, 1.0 = full)
+    pub fn element<R: AsGlowRenderer>(
+        renderer: &R,
+        blurred_texture: &TextureRenderBuffer<GlesTexture>,
+        element_geo: Rectangle<i32, Local>,
+        screen_size: Size<i32, Physical>,
+        scale: f64,
+        transform: Transform,
+        corner_radius: f32,
+        alpha: f32,
+        tint_color: [f32; 3],
+        tint_strength: f32,
+    ) -> TextureShaderElement {
+        use crate::utils::geometry::RectLocalExt;
+
+        let shader = Self::get(renderer);
+
+        // Create texture element from the blurred background
+        // Position at element's location, sized to window dimensions
+        let location: Point<f64, Physical> =
+            (element_geo.loc.x as f64, element_geo.loc.y as f64).into();
+
+        // Convert from Local to Logical, then to Physical
+        // Note: The blur texture is always captured in Transform::Normal orientation,
+        // so we don't need to apply output transform here.
+        let phys_geo: Rectangle<i32, Physical> = element_geo
+            .as_logical()
+            .to_physical_precise_round(scale);
+
+        // If transform is not Normal, we need to transform the coordinates
+        // Transform affects how coordinates map to the buffer
+        let phys_geo = if transform != Transform::Normal {
+            // Transform the location within the screen bounds
+            let transformed_loc = transform.transform_point_in(
+                phys_geo.loc,
+                &screen_size,
+            );
+            let transformed_size = transform.transform_size(phys_geo.size);
+            Rectangle::new(transformed_loc, transformed_size)
+        } else {
+            phys_geo
+        };
+
+        // Calculate src_rect to crop the correct region from the blur texture
+        // src_rect is in Logical coordinates (pixel positions in the source texture)
+        // NOT normalized 0-1 coordinates!
+        let src_rect = Rectangle::<f64, Logical>::new(
+            (phys_geo.loc.x as f64, phys_geo.loc.y as f64).into(),
+            (phys_geo.size.w as f64, phys_geo.size.h as f64).into(),
+        );
+
+        tracing::debug!(
+            element_x = element_geo.loc.x,
+            element_y = element_geo.loc.y,
+            element_w = element_geo.size.w,
+            element_h = element_geo.size.h,
+            screen_w = screen_size.w,
+            screen_h = screen_size.h,
+            src_rect_x = src_rect.loc.x,
+            src_rect_y = src_rect.loc.y,
+            src_rect_w = src_rect.size.w,
+            src_rect_h = src_rect.size.h,
+            "BlurredBackdropShader::element creating texture element with src_rect (pixel coords)"
+        );
+
+        // Create texture element at window position
+        // TEST: No src_rect - render full texture to see what's in it
+        // This should show the entire blurred background scaled to window size
+        let output_size = Size::<i32, Logical>::from((element_geo.size.w, element_geo.size.h));
+        let source_elem = TextureRenderElement::from_texture_render_buffer(
+            location,
+            blurred_texture,
+            Some(alpha),
+            Some(src_rect),    // TEST: No cropping - show full texture
+            Some(output_size), // TEST: No size override - use texture size
+            Kind::Unspecified,
+        );
+
+        // Debug: Check what geometry the source element reports
+        let geo = source_elem.geometry(1.0.into());
+        tracing::debug!(
+            geo_x = geo.loc.x,
+            geo_y = geo.loc.y,
+            geo_w = geo.size.w,
+            geo_h = geo.size.h,
+            "BlurredBackdropShader source_elem geometry"
+        );
+
+        TextureShaderElement::new(
+            source_elem,
+            shader,
+            vec![
+                Uniform::new("alpha", alpha),
+                Uniform::new(
+                    "size",
+                    [element_geo.size.w as f32, element_geo.size.h as f32],
+                ),
+                Uniform::new("screen_size", [screen_size.w as f32, screen_size.h as f32]),
+                Uniform::new(
+                    "element_pos",
+                    [element_geo.loc.x as f32, element_geo.loc.y as f32],
+                ),
+                Uniform::new("corner_radius", corner_radius),
+                Uniform::new("tint_color", tint_color),
+                Uniform::new("tint_strength", tint_strength),
+            ],
+        )
+    }
+}
 
 pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
     {
@@ -373,6 +1196,11 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
         if egl_context.user_data().get::<IndicatorShader>().is_some()
             && egl_context.user_data().get::<BackdropShader>().is_some()
             && egl_context.user_data().get::<PostprocessShader>().is_some()
+            && egl_context.user_data().get::<BlurShader>().is_some()
+            && egl_context
+                .user_data()
+                .get::<BlurredBackdropShader>()
+                .is_some()
         {
             return Ok(());
         }
@@ -400,6 +1228,35 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
             UniformName::new("color_mode", UniformType::_1f),
         ],
     )?;
+    let blur_shader = renderer.compile_custom_texture_shader(
+        BLUR_SHADER,
+        &[
+            UniformName::new("tex_size", UniformType::_2f),
+            UniformName::new("blur_radius", UniformType::_1f),
+            UniformName::new("direction", UniformType::_1f),
+        ],
+    )?;
+    let shadow_shader = renderer.compile_custom_pixel_shader(
+        SHADOW_SHADER,
+        &[
+            UniformName::new("shadow_color", UniformType::_3f),
+            UniformName::new("shadow_radius", UniformType::_1f),
+            UniformName::new("shadow_blur", UniformType::_1f),
+            UniformName::new("shadow_offset", UniformType::_2f),
+        ],
+    )?;
+    let blurred_backdrop_shader = renderer.compile_custom_texture_shader(
+        BLURRED_BACKDROP_SHADER,
+        &[
+            UniformName::new("alpha", UniformType::_1f),
+            UniformName::new("size", UniformType::_2f),
+            UniformName::new("screen_size", UniformType::_2f),
+            UniformName::new("element_pos", UniformType::_2f),
+            UniformName::new("corner_radius", UniformType::_1f),
+            UniformName::new("tint_color", UniformType::_3f),
+            UniformName::new("tint_strength", UniformType::_1f),
+        ],
+    )?;
 
     let egl_context = renderer.egl_context();
     egl_context
@@ -411,8 +1268,79 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
     egl_context
         .user_data()
         .insert_if_missing(|| PostprocessShader(postprocess_shader));
+    egl_context
+        .user_data()
+        .insert_if_missing(|| BlurShader(blur_shader));
+    egl_context
+        .user_data()
+        .insert_if_missing(|| ShadowShader(shadow_shader));
+    egl_context
+        .user_data()
+        .insert_if_missing(|| BlurredBackdropShader(blurred_backdrop_shader));
 
     Ok(())
+}
+
+/// Information about a blur region for rendering
+#[derive(Debug, Clone)]
+pub struct BlurRegionInfo {
+    /// The geometry of the blur region in local coordinates
+    pub geometry: Rectangle<i32, Local>,
+    /// Corner radius for the blur region
+    pub corner_radius: f32,
+    /// Alpha/opacity of the blur
+    pub alpha: f32,
+}
+
+/// Create a blurred texture element from the background
+///
+/// This is a simplified blur that uses the blur shader directly on the source texture.
+/// For a full implementation, this would need multi-pass rendering.
+#[profiling::function]
+pub fn create_blur_element<R>(
+    renderer: &R,
+    source_texture: &TextureRenderBuffer<GlesTexture>,
+    blur_region: &BlurRegionInfo,
+    output_scale: f64,
+) -> TextureShaderElement
+where
+    R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
+    R::TextureId: Send + Clone + 'static,
+{
+    let blur_shader = BlurShader::get(renderer);
+    let blur_radius = DEFAULT_BLUR_RADIUS;
+
+    // Convert geometry to physical coordinates
+    let phys_geo: Rectangle<i32, Physical> = blur_region
+        .geometry
+        .as_logical()
+        .to_physical_precise_round(output_scale);
+
+    // Create source element from the background texture
+    // We'll sample from the region corresponding to where the blur window is
+    let location: Point<f64, Physical> = (phys_geo.loc.x as f64, phys_geo.loc.y as f64).into();
+    let source_elem = TextureRenderElement::from_texture_render_buffer(
+        location,
+        source_texture,
+        Some(blur_region.alpha),
+        None, // Sample whole texture, positioning handles region
+        None,
+        Kind::Unspecified,
+    );
+
+    let geo = source_elem.geometry(1.0.into());
+
+    // Apply blur shader (single pass - for full blur would need two passes)
+    // Using horizontal direction - for better results, would need ping-pong passes
+    TextureShaderElement::new(
+        source_elem,
+        blur_shader,
+        vec![
+            Uniform::new("tex_size", [geo.size.w as f32, geo.size.h as f32]),
+            Uniform::new("blur_radius", blur_radius),
+            Uniform::new("direction", 0.5), // Diagonal blur as compromise
+        ],
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -501,25 +1429,29 @@ where
         }
 
         let theme = theme.cosmic();
-        if let Some(grab_elements) = seat
-            .user_data()
-            .get::<SeatMoveGrabState>()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|state| state.render::<CosmicMappedRenderElement<R>, R>(renderer, output, theme))
-        {
-            elements.extend(grab_elements.into_iter().map(|elem| {
-                CosmicElement::MoveGrab(RescaleRenderElement::from_element(
-                    elem,
-                    focal_point
-                        .as_logical()
-                        .to_physical(output.current_scale().fractional_scale())
-                        .to_i32_round(),
-                    zoom_scale,
-                ))
-            }));
+        // Skip move grab render when capturing for blur - the grabbed window
+        // is always on top and shouldn't be included in the blur source
+        if !should_skip_blur_backdrops() {
+            if let Some(grab_elements) = seat
+                .user_data()
+                .get::<SeatMoveGrabState>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|state| state.render::<CosmicMappedRenderElement<R>, R>(renderer, output, theme))
+            {
+                elements.extend(grab_elements.into_iter().map(|elem| {
+                    CosmicElement::MoveGrab(RescaleRenderElement::from_element(
+                        elem,
+                        focal_point
+                            .as_logical()
+                            .to_physical(output.current_scale().fractional_scale())
+                            .to_i32_round(),
+                        zoom_scale,
+                    ))
+                }));
+            }
         }
 
         if let Some((grab_elements, should_scale)) = seat
@@ -564,6 +1496,8 @@ pub enum ElementFilter {
     All,
     ExcludeWorkspaceOverview,
     LayerShellOnly,
+    /// Exclude windows with blur effect (for capturing background to blur)
+    ExcludeBlurWindows,
 }
 
 pub fn output_elements<R>(
@@ -1163,8 +2097,57 @@ where
     CosmicMappedRenderElement<R>: RenderElement<R>,
     WorkspaceRenderElement<R>: RenderElement<R>,
 {
+    // Use default blur state (not actually used for blur rendering yet)
+    let mut blur_state = BlurRenderState::default();
+    render_output_with_blur(
+        gpu,
+        renderer,
+        target,
+        damage_tracker,
+        age,
+        shell,
+        now,
+        output,
+        cursor_mode,
+        screen_filter,
+        loop_handle,
+        &mut blur_state,
+    )
+}
+
+/// Render output with blur support
+#[profiling::function]
+pub fn render_output_with_blur<'d, R>(
+    gpu: Option<&DrmNode>,
+    renderer: &mut R,
+    target: &mut R::Framebuffer<'_>,
+    damage_tracker: &'d mut OutputDamageTracker,
+    age: usize,
+    shell: &Arc<parking_lot::RwLock<Shell>>,
+    now: Time<Monotonic>,
+    output: &Output,
+    cursor_mode: CursorMode,
+    screen_filter: &'d mut ScreenFilterStorage,
+    loop_handle: &calloop::LoopHandle<'static, State>,
+    blur_state: &mut BlurRenderState,
+) -> Result<RenderOutputResult<'d>, RenderError<R::Error>>
+where
+    R: Renderer
+        + ImportAll
+        + ImportMem
+        + ExportMem
+        + Bind<Dmabuf>
+        + Offscreen<GlesTexture>
+        + Blit
+        + AsGlowRenderer,
+    R::TextureId: Send + Clone + 'static,
+    R::Error: FromGlesError,
+    CosmicElement<R>: RenderElement<R>,
+    CosmicMappedRenderElement<R>: RenderElement<R>,
+    WorkspaceRenderElement<R>: RenderElement<R>,
+{
     let shell_ref = shell.read();
-    let (previous_workspace, workspace) = shell_ref
+    let (previous_workspace, workspace_ref) = shell_ref
         .workspaces
         .active(output)
         .ok_or(RenderError::OutputNoMode(OutputNoMode))?;
@@ -1172,8 +2155,25 @@ where
     let previous_workspace = previous_workspace
         .zip(previous_idx)
         .map(|((w, start), idx)| (w.handle, idx, start));
-    let workspace = (workspace.handle, idx);
+    let workspace = (workspace_ref.handle, idx);
     let zoom_state = shell_ref.zoom_state().cloned();
+
+    // Check if there are blur windows and get their geometries
+    let has_blur = workspace_ref.has_blur_windows();
+    let blur_geometries = if has_blur {
+        workspace_ref.blur_window_geometries(1.0)
+    } else {
+        Vec::new()
+    };
+
+    // Debug logging for blur detection
+    tracing::debug!(
+        has_blur = has_blur,
+        blur_geometry_count = blur_geometries.len(),
+        screen_filter_noop = screen_filter.filter.is_noop(),
+        "Blur detection in render_output_with_blur"
+    );
+
     std::mem::drop(shell_ref);
 
     let element_filter = if workspace_overview_is_open(output) {
@@ -1307,6 +2307,167 @@ where
         }
 
         result
+    } else if has_blur && !blur_geometries.is_empty() {
+        // Single-pass blur without frame delay:
+        // 1. Collect elements EXCLUDING blur backdrops
+        // 2. Render to blur source texture
+        // 3. Apply blur and cache
+        // 4. Re-collect elements (now blur backdrops will find cached texture)
+        // 5. Render final scene with blur backdrops
+        tracing::debug!(
+            blur_geometry_count = blur_geometries.len(),
+            "Entering single-pass blur path"
+        );
+
+        let output_size = output
+            .current_mode()
+            .ok_or(RenderError::OutputNoMode(OutputNoMode))?
+            .size
+            .to_logical(1)
+            .to_physical_precise_round(output.current_scale().fractional_scale());
+        let scale = Scale::from(output.current_scale().fractional_scale());
+        let format = target.format().unwrap_or(Fourcc::Abgr8888);
+
+        // Ensure blur textures are allocated
+        blur_state
+            .ensure_textures(renderer, format, output_size, scale)
+            .map_err(RenderError::Rendering)?;
+
+        // Get the currently grabbed window (if any) to exclude it from blur capture
+        // Grabbed windows should be rendered on top and not be part of the blur source
+        {
+            let shell_ref = shell.read();
+            let last_active_seat = shell_ref.seats.last_active();
+            let grabbed_window = last_active_seat
+                .user_data()
+                .get::<SeatMoveGrabState>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|s| s.element());
+            if grabbed_window.is_some() {
+                tracing::debug!("Found grabbed window to exclude from blur");
+            }
+            set_grabbed_window(grabbed_window);
+        }
+
+        // Step 1: Collect elements WITHOUT blur backdrops (for clean background capture)
+        // Set flag to skip blur backdrops during this collection
+        set_skip_blur_backdrops(true);
+        let bg_elements: Vec<CosmicElement<R>> = workspace_elements(
+            gpu,
+            renderer,
+            shell,
+            zoom_state.as_ref(),
+            now,
+            output,
+            previous_workspace,
+            workspace,
+            cursor_mode,
+            element_filter, // Use original filter
+        )?;
+        set_skip_blur_backdrops(false);
+        set_grabbed_window(None); // Clear grabbed window after capture
+
+        // Step 2: Render background elements to texture for blur source
+        let bg_render_ok = if let Some(bg_texture) = blur_state.background_texture.as_mut() {
+            let mut blur_dt = OutputDamageTracker::new(output_size, scale, Transform::Normal);
+
+            let render_result = (|| {
+                let mut gles_frame = bg_texture.render();
+
+                let render_res = gles_frame.draw::<_, RenderError<R::Error>>(|tex| {
+                    let bound = renderer.bind(tex).map_err(RenderError::Rendering)?;
+                    let mut bound_target = bound;
+                    let res = blur_dt.render_output(
+                        renderer,
+                        &mut bound_target,
+                        0, // Full redraw
+                        &bg_elements,
+                        CLEAR_COLOR,
+                    );
+
+                    match res {
+                        Ok(_) => Ok(Vec::new()),
+                        Err(e) => Err(e.into()),
+                    }
+                });
+
+                render_res.map_err(|_| ())
+            })();
+
+            render_result.is_ok()
+        } else {
+            false
+        };
+
+        // Step 3: Apply blur passes and cache result
+        let blur_applied = if bg_render_ok && blur_state.is_ready() {
+            if let (Some(bg), Some(ping), Some(pong)) = (
+                blur_state.background_texture.as_ref().cloned(),
+                blur_state.texture_a.as_mut(),
+                blur_state.texture_b.as_mut(),
+            ) {
+                let blur_result = apply_blur_passes(
+                    renderer,
+                    &bg,
+                    ping,
+                    pong,
+                    output_size,
+                    scale,
+                    BLUR_ITERATIONS,
+                );
+                blur_state.blur_applied = blur_result.is_ok();
+
+                if blur_result.is_ok() {
+                    // Cache blurred texture - floating layout will find this
+                    let output_name = output.name();
+                    cache_blur_texture(
+                        &output_name,
+                        BlurredTextureInfo {
+                            texture: pong.clone(),
+                            size: output_size,
+                            scale,
+                        },
+                    );
+                    tracing::debug!(output = %output_name, "Cached blurred texture for same-frame use");
+                    true
+                } else {
+                    tracing::warn!("Blur passes failed");
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Step 4: Re-collect ALL elements (blur backdrops will now find cached texture)
+        let final_elements: Vec<CosmicElement<R>> = workspace_elements(
+            gpu,
+            renderer,
+            shell,
+            zoom_state.as_ref(),
+            now,
+            output,
+            previous_workspace,
+            workspace,
+            cursor_mode,
+            element_filter, // Use original filter (typically All)
+        )?;
+
+        // Step 5: Render final scene with blur backdrops to actual target
+        let result = damage_tracker.render_output(
+            renderer,
+            target,
+            if blur_applied { 0 } else { age }, // Force full redraw if blur active
+            &final_elements,
+            CLEAR_COLOR,
+        )?;
+
+        Ok((result, final_elements))
     } else {
         render_workspace(
             gpu,

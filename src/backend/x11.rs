@@ -148,6 +148,7 @@ impl X11State {
             dirty: false,
             pending: true,
             screen_filter_state: ScreenFilterStorage::default(),
+            blur_state: render::BlurRenderState::default(),
         });
 
         // schedule first render
@@ -209,6 +210,7 @@ pub struct Surface {
     dirty: bool,
     pending: bool,
     screen_filter_state: ScreenFilterStorage,
+    blur_state: render::BlurRenderState,
 }
 
 impl Surface {
@@ -220,7 +222,7 @@ impl Surface {
         let mut fb = renderer
             .bind(&mut buffer)
             .with_context(|| "Failed to bind dmabuf")?;
-        match render::render_output(
+        match render::render_output_with_blur(
             None,
             renderer,
             &mut fb,
@@ -232,6 +234,7 @@ impl Surface {
             render::CursorMode::NotDefault,
             &mut self.screen_filter_state,
             &state.event_loop_handle,
+            &mut self.blur_state,
         ) {
             Ok(RenderOutputResult { damage, states, .. }) => {
                 self.surface

@@ -24,7 +24,10 @@ use smithay::{
 };
 
 use crate::{
-    backend::render::{IndicatorShader, Key, Usage, element::AsGlowRenderer},
+    backend::render::{
+        BackdropShader, BlurredBackdropShader, IndicatorShader, Key, Usage,
+        element::AsGlowRenderer, get_cached_blur_texture, is_window_grabbed, should_skip_blur_backdrops,
+    },
     shell::{
         CosmicSurface, Direction, ManagedLayer, MoveResult, ResizeMode,
         element::{
@@ -1684,6 +1687,42 @@ impl FloatingLayout {
         }
         self.refresh(); //fixup any out of bounds elements
     }
+
+    /// Check if any windows in this layout have blur enabled
+    pub fn has_blur_windows(&self) -> bool {
+        let count = self.space.elements().filter(|elem| elem.has_blur()).count();
+        if count > 0 {
+            tracing::debug!(blur_window_count = count, "FloatingLayout has blur windows");
+        }
+        count > 0
+    }
+
+    /// Get the geometries of all windows that have blur enabled
+    /// Returns (geometry, alpha) tuples
+    pub fn blur_window_geometries(&self, alpha: f32) -> Vec<(Rectangle<i32, Local>, f32)> {
+        if self.space.outputs().next().is_none() {
+            return Vec::new();
+        }
+
+        self.animations
+            .iter()
+            .filter(|(_, anim)| matches!(anim, Animation::Minimize { .. }))
+            .map(|(elem, _)| elem)
+            .chain(self.space.elements().rev())
+            .filter(|elem| elem.has_blur())
+            .filter_map(|elem| {
+                let anim_opt = self.animations.get(elem);
+                let (geometry, elem_alpha) = if let Some(anim) = anim_opt {
+                    (*anim.previous_geometry(), alpha * anim.alpha())
+                } else {
+                    let geo = self.space.element_geometry(elem)?;
+                    (geo.as_local(), alpha)
+                };
+                Some((geometry, elem_alpha))
+            })
+            .collect()
+    }
+
     #[profiling::function]
     pub fn render_popups<R>(
         &self,
@@ -1757,6 +1796,22 @@ impl FloatingLayout {
 
         let mut elements = Vec::default();
 
+        // When capturing background for blur, we need to skip all windows that are
+        // at or above the topmost blur-requesting window. The space.elements().rev()
+        // iterates top-to-bottom, so we skip until we pass the first blur window.
+        let mut found_blur_window = false;
+
+        // Debug: Log how many windows are in the space during blur capture
+        if should_skip_blur_backdrops() {
+            let window_count = self.space.elements().count();
+            let window_list: Vec<_> = self.space.elements().map(|e| e.active_window().app_id()).collect();
+            tracing::debug!(
+                window_count = window_count,
+                windows = ?window_list,
+                "Blur capture: iterating windows in space"
+            );
+        }
+
         for elem in self
             .animations
             .iter()
@@ -1764,6 +1819,27 @@ impl FloatingLayout {
             .map(|(elem, _)| elem)
             .chain(self.space.elements().rev())
         {
+            // When capturing background for blur:
+            // - Skip all windows until we pass the first (topmost) blur window
+            // - Skip grabbed/dragged windows (they're rendered on top and shouldn't blur themselves)
+            // - This ensures we only capture what's BEHIND the blur window in z-order
+            if should_skip_blur_backdrops() {
+                // Skip grabbed/dragged window - it's always on top
+                if is_window_grabbed(elem) {
+                    continue;
+                }
+                if elem.has_blur() {
+                    // Found a blur window - mark it and skip
+                    found_blur_window = true;
+                    continue;
+                } else if !found_blur_window {
+                    // Haven't reached a blur window yet, skip windows above it
+                    continue;
+                }
+                // Otherwise: found_blur_window is true and this is a non-blur window
+                // below the blur window - render it
+            }
+
             let anim_opt = self.animations.get(elem);
             let (mut geometry, alpha) = anim_opt
                 .map(|anim| {
@@ -1875,6 +1951,63 @@ impl FloatingLayout {
                     // using client_driven_geometry(). No buffer rescaling or relocation
                     // needed - the client renders at the animated size and we already
                     // positioned it at the animated location.
+                }
+            }
+
+            // Add blur backdrop for windows that request KDE blur (independent of focus state)
+            // Design spec: background: rgba(255, 255, 255, 0.10), backdrop-filter: blur(50px)
+            // Skip adding backdrop if we're capturing background for blur
+            if elem.has_blur() && !should_skip_blur_backdrops() {
+                let radius = elem.corner_radius(geometry.size.as_logical(), 8);
+                let corner_radius = radius[0] as f32;
+
+                // Get the output name for looking up cached blur texture
+                let output_name = output.name();
+
+                // Try to use the cached blur texture for real backdrop blur
+                if let Some(blur_info) = get_cached_blur_texture(&output_name) {
+                    tracing::debug!(
+                        output = %output_name,
+                        geometry_x = geometry.loc.x,
+                        geometry_y = geometry.loc.y,
+                        geometry_w = geometry.size.w,
+                        geometry_h = geometry.size.h,
+                        texture_w = blur_info.size.w,
+                        texture_h = blur_info.size.h,
+                        corner_radius = corner_radius,
+                        "Creating BlurredBackdropShader element"
+                    );
+                    // Use BlurredBackdropShader with the cached blurred texture
+                    let blur_backdrop = BlurredBackdropShader::element(
+                        renderer,
+                        &blur_info.texture,
+                        geometry,
+                        blur_info.size,
+                        output.current_scale().fractional_scale(),
+                        output.current_transform(),
+                        corner_radius,
+                        alpha * 0.95, // DEBUG: High opacity to verify blur is rendering
+                        [1.0, 1.0, 1.0], // White tint
+                        0.3,          // DEBUG: Higher tint to make more visible
+                    );
+                    // DEBUG: Render blur backdrop on TOP to verify it's working
+                    // TODO: Change to insert(0) once verified
+                    window_elements.push(blur_backdrop.into());
+                } else {
+                    tracing::debug!(
+                        output = %output_name,
+                        "No cached blur texture available, using fallback"
+                    );
+                    // Fallback: Use solid color backdrop when blur texture not available
+                    let blur_backdrop = BackdropShader::element(
+                        renderer,
+                        Key::Window(Usage::Overlay, elem.key()),
+                        geometry,
+                        corner_radius,
+                        alpha * 0.25, // 25% opacity (more visible since blur isn't available)
+                        [0.9, 0.9, 0.95], // Slightly tinted white for frosted look
+                    );
+                    window_elements.insert(0, blur_backdrop.into());
                 }
             }
 

@@ -445,6 +445,38 @@ impl Workspace {
         self.tiling_layer.refresh();
     }
 
+    /// Check if this workspace has any windows with blur enabled
+    pub fn has_blur_windows(&self) -> bool {
+        let floating_has_blur = self.floating_layer.has_blur_windows();
+        let tiling_has_blur = self.tiling_layer.mapped().any(|(m, _)| m.has_blur());
+        let result = floating_has_blur || tiling_has_blur;
+        
+        if result {
+            tracing::debug!(
+                floating_has_blur = floating_has_blur,
+                tiling_has_blur = tiling_has_blur,
+                "Workspace has blur windows"
+            );
+        }
+        
+        result
+    }
+
+    /// Get blur window geometries from this workspace
+    /// Returns (geometry, alpha) tuples for all blur windows
+    pub fn blur_window_geometries(&self, alpha: f32) -> Vec<(Rectangle<i32, Local>, f32)> {
+        let mut geometries = self.floating_layer.blur_window_geometries(alpha);
+        
+        // Add tiling layer blur windows
+        for (mapped, geo) in self.tiling_layer.mapped() {
+            if mapped.has_blur() {
+                geometries.push((geo, alpha));
+            }
+        }
+        
+        geometries
+    }
+
     fn has_activation_token(&self, xdg_activation_state: &XdgActivationState) -> bool {
         xdg_activation_state.tokens().any(|(_, data)| {
             if let ActivationContext::Workspace(handle) =
