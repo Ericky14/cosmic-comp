@@ -553,6 +553,14 @@ where
     R: Renderer + Bind<Dmabuf> + Offscreen<GlesTexture> + AsGlowRenderer,
     R::TextureId: Send + Clone + 'static,
 {
+    let _span = tracing::info_span!(
+        "blur_passes",
+        iterations = iterations,
+        tex_w = tex_size.w,
+        tex_h = tex_size.h,
+    )
+    .entered();
+
     let blur_shader = BlurShader::get(renderer);
     let blur_radius = DEFAULT_BLUR_RADIUS;
 
@@ -606,6 +614,14 @@ where
             false,
         )?;
     }
+
+    tracing::info!(
+        iterations = iterations,
+        tex_w = tex_size.w,
+        tex_h = tex_size.h,
+        blur_radius = blur_radius,
+        "Blur passes complete"
+    );
 
     Ok(())
 }

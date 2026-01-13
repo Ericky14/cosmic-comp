@@ -5,12 +5,13 @@ use crate::{
         BLUR_ITERATIONS, BlurRenderState, BlurredTextureInfo, CLEAR_COLOR, CursorMode,
         ElementFilter, GlMultiError, GlMultiRenderer, PostprocessOutputConfig, PostprocessShader,
         PostprocessState, apply_blur_passes, cache_blur_texture, cache_blur_texture_for_window,
-        clear_exclude_z_threshold, element::{CosmicElement, DamageElement}, init_shaders,
-        output_elements, set_exclude_z_threshold, set_grabbed_window, set_skip_blur_backdrops,
-        workspace_elements,
+        clear_exclude_z_threshold,
+        element::{CosmicElement, DamageElement},
+        init_shaders, output_elements, set_exclude_z_threshold, set_grabbed_window,
+        set_skip_blur_backdrops, workspace_elements,
     },
     config::ScreenFilter,
-    shell::{grabs::SeatMoveGrabState, Shell},
+    shell::{Shell, grabs::SeatMoveGrabState},
     state::SurfaceDmabufFeedback,
     utils::{prelude::*, quirks::workspace_overview_is_open},
     wayland::{
@@ -1081,32 +1082,33 @@ impl SurfaceThreadState {
             };
 
             if !blur_groups.is_empty() {
+                let blur_start = std::time::Instant::now();
+                // Mode size is already in physical pixels - use it directly for blur textures
                 let output_size = output_ref
                     .current_mode()
-                    .map(|m| {
-                        m.size
-                            .to_logical(1)
-                            .to_physical_precise_round(output_ref.current_scale().fractional_scale())
-                    })
+                    .map(|m| m.size)
                     .unwrap_or_default();
                 let scale = Scale::from(output_ref.current_scale().fractional_scale());
                 let format = compositor.format();
                 let _output_transform = output_ref.current_transform();
 
                 // Ensure blur textures are allocated
-                if let Err(err) = self
-                    .blur_state
-                    .ensure_textures(&mut renderer, format, output_size, scale)
+                if let Err(err) =
+                    self.blur_state
+                        .ensure_textures(&mut renderer, format, output_size, scale)
                 {
                     tracing::warn!(?err, "Failed to allocate blur textures");
                 } else {
                     let total_windows: usize = blur_groups.iter().map(|g| g.windows.len()).sum();
-                    tracing::trace!(
-                        blur_group_count = blur_groups.len(),
-                        total_blur_windows = total_windows,
+                    let _blur_span = tracing::info_span!(
+                        "kms_blur_processing",
                         output = %output_name,
-                        "KMS: Processing blur windows"
-                    );
+                        blur_groups = blur_groups.len(),
+                        blur_windows = total_windows,
+                        output_w = output_size.w,
+                        output_h = output_size.h,
+                    )
+                    .entered();
 
                     // Get grabbed window to exclude from blur capture
                     {
@@ -1145,19 +1147,27 @@ impl SurfaceThreadState {
                     if let Some((previous_workspace, workspace)) = workspace_info {
                         // Process each blur group
                         let mut any_blur_applied = false;
-                        for group in &blur_groups {
-                            tracing::debug!(
-                                capture_z_threshold = group.capture_z_threshold,
-                                windows_in_group = group.windows.len(),
-                                "KMS: Capturing blur for group"
-                            );
+                        for (group_idx, group) in blur_groups.iter().enumerate() {
+                            let _group_span = tracing::info_span!(
+                                "blur_group",
+                                group = group_idx,
+                                windows = group.windows.len(),
+                                z_threshold = group.capture_z_threshold,
+                            )
+                            .entered();
 
                             // Set z-index threshold for the group
                             set_exclude_z_threshold(group.capture_z_threshold);
                             set_skip_blur_backdrops(true);
 
                             // Capture scene elements for the group (no cursor for blur capture)
-                            let capture_elements: Result<Vec<CosmicElement<GlMultiRenderer>>, _> =
+                            let capture_elements: Result<Vec<CosmicElement<GlMultiRenderer>>, _> = {
+                                let _capture_span = tracing::info_span!(
+                                    "blur_capture_elements",
+                                    z_threshold = group.capture_z_threshold,
+                                )
+                                .entered();
+
                                 workspace_elements(
                                     Some(&render_node),
                                     &mut renderer,
@@ -1169,7 +1179,8 @@ impl SurfaceThreadState {
                                     workspace,
                                     CursorMode::None,
                                     element_filter,
-                                );
+                                )
+                            };
 
                             clear_exclude_z_threshold();
                             set_skip_blur_backdrops(false);
@@ -1183,8 +1194,18 @@ impl SurfaceThreadState {
                             };
 
                             // Render captured elements to background texture
-                            let bg_render_ok =
-                                if let Some(bg_texture) = self.blur_state.background_texture.as_mut() {
+                            let bg_render_ok = {
+                                let _bg_render_span = tracing::info_span!(
+                                    "blur_bg_render",
+                                    elements = capture_elements.len(),
+                                    width = output_size.w,
+                                    height = output_size.h,
+                                )
+                                .entered();
+
+                                if let Some(bg_texture) =
+                                    self.blur_state.background_texture.as_mut()
+                                {
                                     let mut blur_dt = OutputDamageTracker::new(
                                         output_size,
                                         scale,
@@ -1194,8 +1215,9 @@ impl SurfaceThreadState {
                                     let render_result = (|| {
                                         let mut gles_frame = bg_texture.render();
                                         gles_frame.draw::<_, RenderError<GlMultiError>>(|tex| {
-                                            let bound =
-                                                renderer.bind(tex).map_err(RenderError::Rendering)?;
+                                            let bound = renderer
+                                                .bind(tex)
+                                                .map_err(RenderError::Rendering)?;
                                             let mut bound_target = bound;
                                             let res = blur_dt.render_output(
                                                 &mut renderer,
@@ -1214,7 +1236,8 @@ impl SurfaceThreadState {
                                     render_result.is_ok()
                                 } else {
                                     false
-                                };
+                                }
+                            };
 
                             // Apply blur passes and cache for all windows in group
                             if bg_render_ok && self.blur_state.is_ready() {
@@ -1235,7 +1258,9 @@ impl SurfaceThreadState {
 
                                     if blur_result.is_ok() {
                                         // Cache the same blurred texture for all windows in this group
-                                        for (window_key, window_geo, _alpha, z_idx) in &group.windows {
+                                        for (window_key, window_geo, _alpha, z_idx) in
+                                            &group.windows
+                                        {
                                             tracing::trace!(
                                                 output = %output_name,
                                                 global_z_idx = z_idx,
@@ -1274,6 +1299,16 @@ impl SurfaceThreadState {
                                 );
                             }
                         }
+
+                        let blur_elapsed = blur_start.elapsed();
+                        tracing::info!(
+                            output = %output_name,
+                            blur_groups = blur_groups.len(),
+                            blur_applied = any_blur_applied,
+                            elapsed_us = blur_elapsed.as_micros(),
+                            elapsed_ms = ?blur_elapsed.as_millis(),
+                            "KMS blur processing complete"
+                        );
                     }
                 }
             }
