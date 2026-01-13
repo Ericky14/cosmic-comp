@@ -2415,19 +2415,25 @@ where
             .ensure_textures(renderer, format, output_size, scale)
             .map_err(RenderError::Rendering)?;
 
-        // Get blur windows in Z-order (bottom to top)
-        let blur_windows = {
+        // Get blur windows GROUPED by shared capture requirements
+        // Consecutive blur windows (no non-blur windows between them) share a single capture
+        let blur_groups = {
             let shell_ref = shell.read();
             let (_, workspace_ref) = shell_ref
                 .workspaces
                 .active(output)
                 .ok_or(RenderError::OutputNoMode(OutputNoMode))?;
-            workspace_ref.blur_windows_ordered(1.0)
+            workspace_ref.blur_windows_grouped(1.0)
         };
 
+        let total_windows: usize = blur_groups.iter().map(|g| g.windows.len()).sum();
         tracing::debug!(
-            blur_window_count = blur_windows.len(),
-            "Processing blur windows iteratively"
+            blur_group_count = blur_groups.len(),
+            total_blur_windows = total_windows,
+            "Processing blur windows in {} groups (optimized from {} captures to {})",
+            blur_groups.len(),
+            total_windows,
+            blur_groups.len()
         );
 
         // Get the currently grabbed window (if any) to exclude it from blur capture
@@ -2448,22 +2454,22 @@ where
             set_grabbed_window(grabbed_window);
         }
 
-        // Iterative blur: for each blur window, capture everything below it
+        // Optimized iterative blur: one capture per GROUP, then blur for each window in group
         let mut any_blur_applied = false;
-        for (_idx, (window_key, _geometry, _alpha, global_z_idx)) in blur_windows.iter().enumerate()
-        {
+        for group in &blur_groups {
             tracing::debug!(
-                global_z_idx = global_z_idx,
-                "Capturing blur for window (excluding all windows at z >= {})",
-                global_z_idx
+                capture_z_threshold = group.capture_z_threshold,
+                windows_in_group = group.windows.len(),
+                "Capturing blur for group (single capture for {} windows)",
+                group.windows.len()
             );
 
-            // Set z-index threshold - all windows at this index or above will be excluded
-            // This includes the blur window itself AND any non-blur windows above it
-            set_exclude_z_threshold(*global_z_idx);
-            set_skip_blur_backdrops(true); // Also skip blur backdrops during capture
+            // Set z-index threshold for the ENTIRE group (use the lowest z-index)
+            // All windows in this group see the same "below content"
+            set_exclude_z_threshold(group.capture_z_threshold);
+            set_skip_blur_backdrops(true);
 
-            // Capture scene elements (excluding windows at or above this z-index)
+            // Capture scene elements ONCE for the entire group
             let capture_elements: Vec<CosmicElement<R>> = workspace_elements(
                 gpu,
                 renderer,
@@ -2480,7 +2486,7 @@ where
             clear_exclude_z_threshold();
             set_skip_blur_backdrops(false);
 
-            // Render captured elements to background texture
+            // Render captured elements to background texture (once per group)
             let bg_render_ok = if let Some(bg_texture) = blur_state.background_texture.as_mut() {
                 let mut blur_dt = OutputDamageTracker::new(output_size, scale, Transform::Normal);
 
@@ -2512,7 +2518,8 @@ where
                 false
             };
 
-            // Apply blur passes and cache result for this specific window
+            // Apply blur passes ONCE and cache for ALL windows in this group
+            // Since they share the same background, they share the same blurred result
             if bg_render_ok && blur_state.is_ready() {
                 if let (Some(bg), Some(ping), Some(pong)) = (
                     blur_state.background_texture.as_ref().cloned(),
@@ -2530,25 +2537,27 @@ where
                     );
 
                     if blur_result.is_ok() {
-                        // Cache blurred texture for this specific window
-                        cache_blur_texture_for_window(
-                            &output_name,
-                            window_key,
-                            BlurredTextureInfo {
-                                texture: pong.clone(),
-                                size: output_size,
-                                scale,
-                            },
-                        );
-                        tracing::debug!(
-                            global_z_idx = global_z_idx,
-                            "Cached per-window blurred texture"
-                        );
+                        // Cache the SAME blurred texture for ALL windows in this group
+                        for (window_key, _geometry, _alpha, z_idx) in &group.windows {
+                            cache_blur_texture_for_window(
+                                &output_name,
+                                window_key,
+                                BlurredTextureInfo {
+                                    texture: pong.clone(),
+                                    size: output_size,
+                                    scale,
+                                },
+                            );
+                            tracing::debug!(
+                                global_z_idx = z_idx,
+                                "Cached shared blur texture for window in group"
+                            );
+                        }
                         any_blur_applied = true;
                     } else {
                         tracing::warn!(
-                            global_z_idx = global_z_idx,
-                            "Blur passes failed for window"
+                            capture_z_threshold = group.capture_z_threshold,
+                            "Blur passes failed for group"
                         );
                     }
                 }

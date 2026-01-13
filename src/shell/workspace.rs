@@ -8,7 +8,7 @@ use crate::{
     },
     shell::{
         ANIMATION_DURATION, OverviewMode, SeatMoveGrabState,
-        layout::{floating::FloatingLayout, tiling::TilingLayout},
+        layout::{floating::{BlurWindowGroup, FloatingLayout}, tiling::TilingLayout},
     },
     state::State,
     utils::{prelude::*, tween::EaseRectangle},
@@ -483,6 +483,34 @@ impl Workspace {
         }
         
         result
+    }
+
+    /// Get blur windows grouped by shared capture requirements.
+    /// Consecutive blur windows (no non-blur windows between them) share a capture.
+    /// This optimizes rendering by reducing the number of scene captures needed.
+    ///
+    /// For now, this only returns floating layer groups since tiling layer
+    /// windows are typically all below floating windows. This can be extended
+    /// to merge groups across layers if needed.
+    pub fn blur_windows_grouped(&self, alpha: f32) -> Vec<BlurWindowGroup> {
+        let tiled_count = self.tiling_layer.mapped().count();
+        
+        // Get floating layer groups and offset their z-indices
+        let mut groups = self.floating_layer.blur_windows_grouped(alpha);
+        
+        // Offset all z-indices by tiled window count
+        for group in &mut groups {
+            group.capture_z_threshold += tiled_count;
+            for (_, _, _, z_idx) in &mut group.windows {
+                *z_idx += tiled_count;
+            }
+        }
+        
+        // If there are tiled blur windows, we'd need to handle them here
+        // For now, assume tiled windows don't have blur or are at the bottom
+        // and floating windows form their own groups
+        
+        groups
     }
 
     /// Get blur window geometries from this workspace

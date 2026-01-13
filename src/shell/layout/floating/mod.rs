@@ -349,6 +349,16 @@ impl TiledCorners {
     }
 }
 
+/// A group of consecutive blur windows that can share a single background capture.
+/// Windows are grouped when there are no non-blur windows between them.
+#[derive(Clone)]
+pub struct BlurWindowGroup {
+    /// The z-index threshold for capturing (lowest z-index in the group)
+    pub capture_z_threshold: usize,
+    /// Windows in this group: (key, geometry, alpha, z_index)
+    pub windows: Vec<(CosmicMappedKey, Rectangle<i32, Local>, f32, usize)>,
+}
+
 impl FloatingLayout {
     pub fn new(theme: cosmic::Theme, output: &Output) -> FloatingLayout {
         let mut layout = Self {
@@ -1744,6 +1754,113 @@ impl FloatingLayout {
                 Some((elem.key(), geometry, elem_alpha, global_z_idx))
             })
             .collect()
+    }
+
+    /// Get blur windows grouped by shared capture requirements.
+    /// Consecutive blur windows (no non-blur windows between them) share a capture.
+    /// This optimizes rendering by reducing the number of scene captures needed.
+    ///
+    /// Example:
+    /// - Windows: [non-blur z=0, blur z=1, blur z=2, non-blur z=3, blur z=4]
+    /// - Groups: [{threshold=1, windows=[z=1,z=2]}, {threshold=4, windows=[z=4]}]
+    /// - Only 2 captures needed instead of 3
+    pub fn blur_windows_grouped(&self, alpha: f32) -> Vec<BlurWindowGroup> {
+        if self.space.outputs().next().is_none() {
+            return Vec::new();
+        }
+
+        // Count minimizing animations and space elements to get total window count
+        let minimizing_count = self
+            .animations
+            .iter()
+            .filter(|(_, anim)| matches!(anim, Animation::Minimize { .. }))
+            .count();
+        let total_count = minimizing_count + self.space.elements().count();
+
+        if total_count == 0 {
+            return Vec::new();
+        }
+
+        // Collect all windows with their blur status and z-index
+        // We need to track non-blur windows to detect gaps between blur windows
+        let all_windows: Vec<(Option<(CosmicMappedKey, Rectangle<i32, Local>, f32)>, usize, bool)> =
+            self.animations
+                .iter()
+                .filter(|(_, anim)| matches!(anim, Animation::Minimize { .. }))
+                .map(|(elem, _)| elem)
+                .chain(self.space.elements().rev())
+                .enumerate()
+                .filter_map(|(front_to_back_idx, elem)| {
+                    let global_z_idx = total_count - 1 - front_to_back_idx;
+                    let has_blur = elem.has_blur();
+
+                    if has_blur {
+                        let anim_opt = self.animations.get(elem);
+                        let (geometry, elem_alpha) = if let Some(anim) = anim_opt {
+                            (*anim.previous_geometry(), alpha * anim.alpha())
+                        } else {
+                            let geo = self.space.element_geometry(elem)?;
+                            (geo.as_local(), alpha)
+                        };
+                        Some((Some((elem.key(), geometry, elem_alpha)), global_z_idx, true))
+                    } else {
+                        // Non-blur window - we just need to track its position
+                        Some((None, global_z_idx, false))
+                    }
+                })
+                .collect();
+
+        // Group consecutive blur windows (sorted by z-index, bottom to top)
+        let mut groups: Vec<BlurWindowGroup> = Vec::new();
+        let mut current_group: Option<BlurWindowGroup> = None;
+        let mut last_z_idx: Option<usize> = None;
+
+        // Sort by z-index (ascending = bottom to top)
+        let mut sorted_windows = all_windows;
+        sorted_windows.sort_by_key(|(_, z_idx, _)| *z_idx);
+
+        for (window_data, z_idx, is_blur) in sorted_windows {
+            if is_blur {
+                if let Some((key, geometry, elem_alpha)) = window_data {
+                    // Check if this blur window is consecutive with the previous
+                    let is_consecutive = last_z_idx.map(|last| z_idx == last + 1).unwrap_or(true);
+
+                    if is_consecutive {
+                        // Add to current group or start new one
+                        if let Some(ref mut group) = current_group {
+                            group.windows.push((key, geometry, elem_alpha, z_idx));
+                        } else {
+                            current_group = Some(BlurWindowGroup {
+                                capture_z_threshold: z_idx,
+                                windows: vec![(key, geometry, elem_alpha, z_idx)],
+                            });
+                        }
+                    } else {
+                        // Gap detected - finish current group and start new one
+                        if let Some(group) = current_group.take() {
+                            groups.push(group);
+                        }
+                        current_group = Some(BlurWindowGroup {
+                            capture_z_threshold: z_idx,
+                            windows: vec![(key, geometry, elem_alpha, z_idx)],
+                        });
+                    }
+                }
+            } else {
+                // Non-blur window creates a gap - finish current group
+                if let Some(group) = current_group.take() {
+                    groups.push(group);
+                }
+            }
+            last_z_idx = Some(z_idx);
+        }
+
+        // Don't forget the last group
+        if let Some(group) = current_group {
+            groups.push(group);
+        }
+
+        groups
     }
 
     /// Get the geometries of all windows that have blur enabled
