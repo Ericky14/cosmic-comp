@@ -2175,11 +2175,13 @@ impl FloatingLayout {
                 if let Some(blur_info) = blur_info {
                     // Use BlurredBackdropShader with the cached blurred texture
                     // CSS equivalent: background: rgba(255, 255, 255, 0.10); backdrop-filter: blur(50px);
+                    // Note: blur texture may be downsampled, so we pass both texture_size and screen_size
                     let blur_backdrop = BlurredBackdropShader::element(
                         renderer,
                         &blur_info.texture,
                         geometry,
-                        blur_info.size,
+                        blur_info.size,        // Texture size (may be downsampled)
+                        blur_info.screen_size, // Original screen size for coordinate mapping
                         output_scale,
                         output_transform,
                         corner_radius,

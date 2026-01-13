@@ -4,8 +4,9 @@ use crate::{
     backend::render::{
         BLUR_ITERATIONS, BlurRenderState, BlurredTextureInfo, CLEAR_COLOR, CursorMode,
         ElementFilter, GlMultiError, GlMultiRenderer, PostprocessOutputConfig, PostprocessShader,
-        PostprocessState, apply_blur_passes, cache_blur_texture, cache_blur_texture_for_window,
-        clear_exclude_z_threshold, compute_element_content_hash,
+        PostprocessState, apply_blur_passes, blur_downsample_enabled, cache_blur_texture,
+        cache_blur_texture_for_window, clear_exclude_z_threshold, compute_element_content_hash,
+        downsample_texture,
         element::{CosmicElement, DamageElement},
         get_blur_group_content_hash, get_cached_blur_texture_for_window, init_shaders,
         output_elements, set_exclude_z_threshold, set_grabbed_window, set_skip_blur_backdrops,
@@ -1204,12 +1205,17 @@ impl SurfaceThreadState {
                             );
 
                             // Check if content has changed since last blur
-                            let stored_hash = get_blur_group_content_hash(&output_name, group.capture_z_threshold);
-                            let content_changed = stored_hash.is_none() || stored_hash != Some(content_hash);
+                            let stored_hash = get_blur_group_content_hash(
+                                &output_name,
+                                group.capture_z_threshold,
+                            );
+                            let content_changed =
+                                stored_hash.is_none() || stored_hash != Some(content_hash);
 
                             // Also verify all windows have cached textures
                             let all_cached = group.windows.iter().all(|(window_key, _, _, _)| {
-                                get_cached_blur_texture_for_window(&output_name, window_key).is_some()
+                                get_cached_blur_texture_for_window(&output_name, window_key)
+                                    .is_some()
                             });
 
                             let can_reuse_cache = !content_changed && all_cached;
@@ -1232,7 +1238,11 @@ impl SurfaceThreadState {
                             );
 
                             // Store the new content hash after we commit to re-blurring
-                            store_blur_group_content_hash(&output_name, group.capture_z_threshold, content_hash);
+                            store_blur_group_content_hash(
+                                &output_name,
+                                group.capture_z_threshold,
+                                content_hash,
+                            );
 
                             // Render captured elements to background texture
                             let bg_render_ok = {
@@ -1280,19 +1290,50 @@ impl SurfaceThreadState {
                                 }
                             };
 
-                            // Apply blur passes and cache for all windows in group
-                            if bg_render_ok && self.blur_state.is_ready() {
-                                if let (Some(bg), Some(ping), Some(pong)) = (
+                            // Downsample background to smaller texture for blur passes (if enabled)
+                            let downsample_enabled = blur_downsample_enabled();
+                            let downsample_ok = if downsample_enabled && bg_render_ok {
+                                if let (Some(bg), Some(ds)) = (
                                     self.blur_state.background_texture.as_ref().cloned(),
+                                    self.blur_state.downsampled_texture.as_mut(),
+                                ) {
+                                    let blur_size = self.blur_state.texture_size;
+                                    downsample_texture(
+                                        &mut renderer,
+                                        &bg,
+                                        ds,
+                                        output_size,
+                                        blur_size,
+                                    )
+                                    .is_ok()
+                                } else {
+                                    false
+                                }
+                            } else {
+                                !downsample_enabled && bg_render_ok // Skip downsample step when disabled
+                            };
+
+                            // Apply blur passes (on downsampled or full-size textures)
+                            if downsample_ok && self.blur_state.is_ready() {
+                                let blur_size = self.blur_state.texture_size;
+                                // Source texture: downsampled if enabled, background if disabled
+                                let blur_source = if downsample_enabled {
+                                    self.blur_state.downsampled_texture.as_ref().cloned()
+                                } else {
+                                    self.blur_state.background_texture.as_ref().cloned()
+                                };
+
+                                if let (Some(src), Some(ping), Some(pong)) = (
+                                    blur_source,
                                     self.blur_state.texture_a.as_mut(),
                                     self.blur_state.texture_b.as_mut(),
                                 ) {
                                     let blur_result = apply_blur_passes(
                                         &mut renderer,
-                                        &bg,
+                                        &src,
                                         ping,
                                         pong,
-                                        output_size,
+                                        blur_size,
                                         scale,
                                         BLUR_ITERATIONS,
                                     );
@@ -1306,6 +1347,9 @@ impl SurfaceThreadState {
                                                 output = %output_name,
                                                 global_z_idx = z_idx,
                                                 window_geo = ?window_geo,
+                                                blur_w = blur_size.w,
+                                                blur_h = blur_size.h,
+                                                downsampled = downsample_enabled,
                                                 "KMS: Caching blur texture for window"
                                             );
                                             cache_blur_texture_for_window(
@@ -1313,7 +1357,8 @@ impl SurfaceThreadState {
                                                 window_key,
                                                 BlurredTextureInfo {
                                                     texture: pong.clone(),
-                                                    size: output_size,
+                                                    size: blur_size,
+                                                    screen_size: output_size,
                                                     scale,
                                                     background_state_hash: content_hash,
                                                 },
@@ -1330,12 +1375,14 @@ impl SurfaceThreadState {
 
                         // Cache global fallback
                         if any_blur_applied {
+                            let blur_size = self.blur_state.texture_size;
                             if let Some(pong) = self.blur_state.texture_b.as_ref() {
                                 cache_blur_texture(
                                     &output_name,
                                     BlurredTextureInfo {
                                         texture: pong.clone(),
-                                        size: output_size,
+                                        size: blur_size,
+                                        screen_size: output_size,
                                         scale,
                                         background_state_hash: 0,
                                     },

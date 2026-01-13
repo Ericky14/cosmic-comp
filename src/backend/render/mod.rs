@@ -132,6 +132,21 @@ pub const DEFAULT_BLUR_RADIUS: f32 = 50.0;
 /// 8 iterations provides smooth CSS blur(50px) equivalent
 pub const BLUR_ITERATIONS: u32 = 8;
 
+/// Check if blur texture downsampling is enabled via env var
+/// When enabled, blur passes run at reduced resolution for better performance.
+/// When disabled, blur runs at full resolution (simpler but more GPU work).
+/// Set COSMIC_BLUR_DOWNSAMPLE=1 to enable.
+pub fn blur_downsample_enabled() -> bool {
+    crate::utils::env::bool_var("COSMIC_BLUR_DOWNSAMPLE").unwrap_or(false)
+}
+
+/// Downsample factor for blur textures (1/4 resolution = 1/2 each dimension)
+/// Blur removes high-frequency detail anyway, so downsampling is visually
+/// nearly identical but ~4x cheaper in memory and ~16x fewer pixels to process.
+/// Factor of 2 = 1/4 pixel count, Factor of 4 = 1/16 pixel count
+/// Only used when COSMIC_BLUR_DOWNSAMPLE=1.
+pub const BLUR_DOWNSAMPLE_FACTOR: i32 = 2;
+
 use once_cell::sync::Lazy;
 /// Global cache for blurred textures per window
 ///
@@ -146,8 +161,10 @@ use std::sync::RwLock;
 pub struct BlurredTextureInfo {
     /// The blurred texture buffer
     pub texture: TextureRenderBuffer<GlesTexture>,
-    /// Size of the texture
+    /// Size of the blurred texture (may be downsampled)
     pub size: Size<i32, Physical>,
+    /// Original screen size (for coordinate mapping when downsampled)
+    pub screen_size: Size<i32, Physical>,
     /// Scale factor
     pub scale: Scale<f64>,
     /// Hash of background state for cache invalidation
@@ -446,17 +463,25 @@ pub fn clear_blur_texture(output_name: &str) {
 /// This implementation uses a "previous frame" approach where the blur
 /// source is the previous frame's content, avoiding the need to render
 /// the scene twice per frame.
+///
+/// Optimization: Blur passes run at reduced resolution (1/BLUR_DOWNSAMPLE_FACTOR)
+/// since blur removes high-frequency detail anyway. This provides ~4x memory savings
+/// and ~16x fewer pixels to process per blur pass.
 #[derive(Debug)]
 pub struct BlurRenderState {
-    /// Texture containing the previous frame's content (used as blur source)
+    /// Texture containing the previous frame's content at full resolution (blur source)
     pub background_texture: Option<TextureRenderBuffer<GlesTexture>>,
-    /// Offscreen texture for blur passes (ping)
+    /// Downsampled texture for blur input (from background_texture)
+    pub downsampled_texture: Option<TextureRenderBuffer<GlesTexture>>,
+    /// Offscreen texture for blur passes (ping) - at reduced resolution
     pub texture_a: Option<TextureRenderBuffer<GlesTexture>>,
-    /// Offscreen texture for blur passes (pong)
+    /// Offscreen texture for blur passes (pong) - at reduced resolution
     pub texture_b: Option<TextureRenderBuffer<GlesTexture>>,
     /// Damage tracker for the blur textures
     pub damage_tracker: Option<OutputDamageTracker>,
-    /// Size of the blur textures
+    /// Size of the full-resolution background texture (screen size)
+    pub screen_size: Size<i32, Physical>,
+    /// Size of the downsampled blur textures
     pub texture_size: Size<i32, Physical>,
     /// Scale factor
     pub scale: Scale<f64>,
@@ -468,9 +493,11 @@ impl Default for BlurRenderState {
     fn default() -> Self {
         Self {
             background_texture: None,
+            downsampled_texture: None,
             texture_a: None,
             texture_b: None,
             damage_tracker: None,
+            screen_size: Size::from((0, 0)),
             texture_size: Size::from((0, 0)),
             scale: Scale::from(1.0),
             blur_applied: false,
@@ -480,6 +507,7 @@ impl Default for BlurRenderState {
 
 impl BlurRenderState {
     /// Create or resize blur textures if needed
+    /// Creates full-size background texture and optionally downsampled blur textures
     pub fn ensure_textures<R: AsGlowRenderer + Offscreen<GlesTexture>>(
         &mut self,
         renderer: &mut R,
@@ -487,19 +515,48 @@ impl BlurRenderState {
         size: Size<i32, Physical>,
         scale: Scale<f64>,
     ) -> Result<(), R::Error> {
+        let downsample_enabled = blur_downsample_enabled();
+
+        // Calculate blur size (downsampled if enabled, full size otherwise)
+        let blur_size: Size<i32, Physical> = if downsample_enabled {
+            Size::from((
+                (size.w / BLUR_DOWNSAMPLE_FACTOR).max(1),
+                (size.h / BLUR_DOWNSAMPLE_FACTOR).max(1),
+            ))
+        } else {
+            size
+        };
+
         // Only recreate if size changed
-        if self.texture_size == size
-            && self.texture_a.is_some()
-            && self.texture_b.is_some()
-            && self.background_texture.is_some()
-        {
+        let textures_valid = if downsample_enabled {
+            self.screen_size == size
+                && self.texture_a.is_some()
+                && self.texture_b.is_some()
+                && self.background_texture.is_some()
+                && self.downsampled_texture.is_some()
+        } else {
+            self.screen_size == size
+                && self.texture_a.is_some()
+                && self.texture_b.is_some()
+                && self.background_texture.is_some()
+        };
+
+        if textures_valid {
             return Ok(());
         }
 
-        let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+        tracing::info!(
+            screen_w = size.w,
+            screen_h = size.h,
+            blur_w = blur_size.w,
+            blur_h = blur_size.h,
+            downsample_enabled = downsample_enabled,
+            "Creating blur textures"
+        );
 
-        // Create background texture (stores previous frame for blur source)
-        let bg_tex = Offscreen::<GlesTexture>::create_buffer(renderer, format, buffer_size)?;
+        // Full-size background texture (stores previous frame for blur source)
+        let full_buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+        let bg_tex = Offscreen::<GlesTexture>::create_buffer(renderer, format, full_buffer_size)?;
         self.background_texture = Some(TextureRenderBuffer::from_texture(
             renderer.glow_renderer(),
             bg_tex,
@@ -508,8 +565,26 @@ impl BlurRenderState {
             None,
         ));
 
-        // Create texture A (ping)
-        let tex_a = Offscreen::<GlesTexture>::create_buffer(renderer, format, buffer_size)?;
+        // Downsampled buffer size for blur passes
+        let blur_buffer_size = blur_size.to_logical(1).to_buffer(1, Transform::Normal);
+
+        // Downsampled texture (intermediate for downsample) - only when downsampling enabled
+        if blur_downsample_enabled() {
+            let ds_tex =
+                Offscreen::<GlesTexture>::create_buffer(renderer, format, blur_buffer_size)?;
+            self.downsampled_texture = Some(TextureRenderBuffer::from_texture(
+                renderer.glow_renderer(),
+                ds_tex,
+                1,
+                Transform::Normal,
+                None,
+            ));
+        } else {
+            self.downsampled_texture = None;
+        }
+
+        // Create texture A (ping) - at blur resolution (reduced or full)
+        let tex_a = Offscreen::<GlesTexture>::create_buffer(renderer, format, blur_buffer_size)?;
         self.texture_a = Some(TextureRenderBuffer::from_texture(
             renderer.glow_renderer(),
             tex_a,
@@ -518,8 +593,8 @@ impl BlurRenderState {
             None,
         ));
 
-        // Create texture B (pong)
-        let tex_b = Offscreen::<GlesTexture>::create_buffer(renderer, format, buffer_size)?;
+        // Create texture B (pong) - at reduced resolution
+        let tex_b = Offscreen::<GlesTexture>::create_buffer(renderer, format, blur_buffer_size)?;
         self.texture_b = Some(TextureRenderBuffer::from_texture(
             renderer.glow_renderer(),
             tex_b,
@@ -531,30 +606,44 @@ impl BlurRenderState {
         // Create damage tracker
         self.damage_tracker = Some(OutputDamageTracker::new(size, scale, Transform::Normal));
 
-        self.texture_size = size;
+        self.screen_size = size;
+        self.texture_size = blur_size;
         self.scale = scale;
         self.blur_applied = false;
         Ok(())
     }
 
-    /// Get background texture (previous frame content)
+    /// Get background texture (previous frame content at full resolution)
     pub fn background_texture(&self) -> Option<&TextureRenderBuffer<GlesTexture>> {
         self.background_texture.as_ref()
     }
 
-    /// Get texture A for rendering
+    /// Get downsampled texture
+    pub fn downsampled_texture(&self) -> Option<&TextureRenderBuffer<GlesTexture>> {
+        self.downsampled_texture.as_ref()
+    }
+
+    /// Get texture A for rendering (at reduced resolution)
     pub fn texture_a(&self) -> Option<&TextureRenderBuffer<GlesTexture>> {
         self.texture_a.as_ref()
     }
 
-    /// Get texture B for rendering
+    /// Get texture B for rendering (at reduced resolution)
     pub fn texture_b(&self) -> Option<&TextureRenderBuffer<GlesTexture>> {
         self.texture_b.as_ref()
     }
 
     /// Check if blur state is ready for rendering
     pub fn is_ready(&self) -> bool {
-        self.background_texture.is_some() && self.texture_a.is_some() && self.texture_b.is_some()
+        let base_ready = self.background_texture.is_some()
+            && self.texture_a.is_some()
+            && self.texture_b.is_some();
+
+        if blur_downsample_enabled() {
+            base_ready && self.downsampled_texture.is_some()
+        } else {
+            base_ready
+        }
     }
 
     /// Create blurred texture elements for the specified blur regions
@@ -644,6 +733,87 @@ impl BlurRenderState {
 
         elements
     }
+}
+
+/// Downsample a texture by rendering it to a smaller target
+/// This uses GPU bilinear filtering for high-quality downscaling
+#[allow(dead_code)]
+pub fn downsample_texture<R>(
+    renderer: &mut R,
+    src_texture: &TextureRenderBuffer<GlesTexture>,
+    dst_texture: &mut TextureRenderBuffer<GlesTexture>,
+    src_size: Size<i32, Physical>,
+    dst_size: Size<i32, Physical>,
+) -> Result<(), GlesError>
+where
+    R: Renderer + Bind<Dmabuf> + Offscreen<GlesTexture> + AsGlowRenderer,
+    R::TextureId: Send + Clone + 'static,
+{
+    let _span = tracing::debug_span!(
+        "downsample_texture",
+        src_w = src_size.w,
+        src_h = src_size.h,
+        dst_w = dst_size.w,
+        dst_h = dst_size.h,
+    )
+    .entered();
+
+    // Create a texture element from the source at position (0, 0)
+    // The element will be rendered to fill the destination texture
+    let src_elem = TextureRenderElement::from_texture_render_buffer(
+        Point::<f64, Physical>::from((0.0, 0.0)),
+        src_texture,
+        Some(1.0),
+        None, // No src_rect - use full texture
+        Some(Size::<i32, Logical>::from((dst_size.w, dst_size.h))), // Scale to dst size
+        Kind::Unspecified,
+    );
+
+    dst_texture.render().draw::<_, GlesError>(|tex| {
+        let glow = renderer.glow_renderer_mut();
+        let mut target = glow.bind(tex)?;
+
+        use smithay::backend::renderer::Renderer as RendererTrait;
+        let mut frame = glow.render(&mut target, dst_size, Transform::Normal)?;
+
+        // Clear and render the downsampled texture
+        use smithay::backend::renderer::element::RenderElement;
+        use smithay::backend::renderer::glow::GlowRenderer;
+        use smithay::backend::renderer::{Color32F, Frame};
+        use smithay::utils::Buffer as BufferCoords;
+
+        let clear_damage = [Rectangle::from_size(dst_size)];
+        frame.clear(Color32F::from([0.0, 0.0, 0.0, 0.0]), &clear_damage)?;
+
+        // Source: full texture in buffer coordinates (original size)
+        let src: Rectangle<f64, BufferCoords> =
+            Rectangle::from_size((src_size.w as f64, src_size.h as f64).into());
+        // Destination: full output in physical coordinates (downsampled size)
+        let dst: Rectangle<i32, Physical> = Rectangle::from_size(dst_size);
+        let damage = [dst];
+
+        <TextureRenderElement<GlesTexture> as RenderElement<GlowRenderer>>::draw(
+            &src_elem,
+            &mut frame,
+            src,
+            dst,
+            &damage,
+            &[],
+        )?;
+
+        drop(frame);
+
+        // Return damage in buffer coordinates
+        let buffer_size: Size<i32, Logical> = dst_size.to_logical(1);
+        let damage_rect = Rectangle::from_size(dst_size);
+        Ok(vec![damage_rect.to_logical(1).to_buffer(
+            1,
+            Transform::Normal,
+            &buffer_size,
+        )])
+    })?;
+
+    Ok(())
 }
 
 /// Apply two-pass Gaussian blur using ping-pong rendering
@@ -1290,10 +1460,14 @@ impl BlurredBackdropShader {
     /// This crops the correct region from the blurred background texture,
     /// applies a tint overlay, and masks with rounded corners.
     ///
+    /// Supports downsampled blur textures - coordinates are scaled from
+    /// screen_size to texture_size automatically.
+    ///
     /// # Arguments
     /// * `renderer` - The renderer to use
-    /// * `blurred_texture` - The pre-blurred background texture (full screen)
+    /// * `blurred_texture` - The pre-blurred background texture (may be downsampled)
     /// * `element_geo` - The geometry of the element (where the backdrop appears)
+    /// * `texture_size` - The actual size of the blur texture (may be smaller than screen)
     /// * `screen_size` - The full screen size for coordinate mapping
     /// * `scale` - Output scale factor for coordinate conversion
     /// * `transform` - Output transform for coordinate conversion
@@ -1305,6 +1479,7 @@ impl BlurredBackdropShader {
         renderer: &R,
         blurred_texture: &TextureRenderBuffer<GlesTexture>,
         element_geo: Rectangle<i32, Local>,
+        texture_size: Size<i32, Physical>,
         screen_size: Size<i32, Physical>,
         scale: f64,
         transform: Transform,
@@ -1339,19 +1514,22 @@ impl BlurredBackdropShader {
             phys_geo
         };
 
-        // Calculate src_rect to crop the correct region from the blur texture
-        // The blur texture is in physical pixel coordinates, so src_rect must be too.
-        // TextureRenderElement interprets src_rect as being in the texture's native
-        // coordinate space (which for our blur texture is physical pixels).
+        // Calculate scale factor for downsampled texture
+        // If texture is smaller than screen, we need to scale coordinates
+        let scale_x = texture_size.w as f64 / screen_size.w as f64;
+        let scale_y = texture_size.h as f64 / screen_size.h as f64;
+
+        // Calculate src_rect in texture coordinates (scaled from screen coordinates)
+        // The blur texture may be downsampled, so we scale the crop region
         let src_rect = Rectangle::<f64, Logical>::new(
             (
-                transformed_phys_geo.loc.x as f64,
-                transformed_phys_geo.loc.y as f64,
+                transformed_phys_geo.loc.x as f64 * scale_x,
+                transformed_phys_geo.loc.y as f64 * scale_y,
             )
                 .into(),
             (
-                transformed_phys_geo.size.w as f64,
-                transformed_phys_geo.size.h as f64,
+                transformed_phys_geo.size.w as f64 * scale_x,
+                transformed_phys_geo.size.h as f64 * scale_y,
             )
                 .into(),
         );
@@ -2673,40 +2851,69 @@ where
                 false
             };
 
-            // Apply blur passes ONCE and cache for ALL windows in this group
-            // Since they share the same background, they share the same blurred result
-            if bg_render_ok && blur_state.is_ready() {
-                if let (Some(bg), Some(ping), Some(pong)) = (
+            // Downsample background to smaller texture for blur passes (if enabled)
+            let downsample_enabled = blur_downsample_enabled();
+            let downsample_ok = if downsample_enabled && bg_render_ok {
+                if let (Some(bg), Some(ds)) = (
                     blur_state.background_texture.as_ref().cloned(),
+                    blur_state.downsampled_texture.as_mut(),
+                ) {
+                    let blur_size = blur_state.texture_size;
+                    downsample_texture(renderer, &bg, ds, output_size, blur_size).is_ok()
+                } else {
+                    false
+                }
+            } else {
+                !downsample_enabled && bg_render_ok // Skip downsample step when disabled
+            };
+
+            // Apply blur passes (on downsampled or full-size textures)
+            // Since they share the same background, they share the same blurred result
+            if downsample_ok && blur_state.is_ready() {
+                let blur_size = blur_state.texture_size;
+                // Source texture: downsampled if enabled, background if disabled
+                let blur_source = if downsample_enabled {
+                    blur_state.downsampled_texture.as_ref().cloned()
+                } else {
+                    blur_state.background_texture.as_ref().cloned()
+                };
+
+                if let (Some(src), Some(ping), Some(pong)) = (
+                    blur_source,
                     blur_state.texture_a.as_mut(),
                     blur_state.texture_b.as_mut(),
                 ) {
                     let blur_result = apply_blur_passes(
                         renderer,
-                        &bg,
+                        &src,
                         ping,
                         pong,
-                        output_size,
+                        blur_size,
                         scale,
                         BLUR_ITERATIONS,
                     );
 
                     if blur_result.is_ok() {
                         // Cache the SAME blurred texture for ALL windows in this group
+                        // Store both blur texture size and original screen size for coordinate mapping
                         for (window_key, _geometry, _alpha, z_idx) in &group.windows {
                             cache_blur_texture_for_window(
                                 &output_name,
                                 window_key,
                                 BlurredTextureInfo {
                                     texture: pong.clone(),
-                                    size: output_size,
+                                    size: blur_size,
+                                    screen_size: output_size,
                                     scale,
                                     background_state_hash: content_hash,
                                 },
                             );
                             tracing::debug!(
                                 global_z_idx = z_idx,
-                                "Cached shared blur texture for window in group"
+                                blur_w = blur_size.w,
+                                blur_h = blur_size.h,
+                                downsampled = downsample_enabled,
+                                "Cached blur texture for window in group"
                             );
                         }
                         any_blur_applied = true;
@@ -2725,12 +2932,14 @@ where
         // Also cache a global fallback for windows that don't have per-window cache
         // (This uses the last captured blur, which is the full background)
         if any_blur_applied {
+            let blur_size = blur_state.texture_size;
             if let Some(pong) = blur_state.texture_b.as_ref() {
                 cache_blur_texture(
                     &output_name,
                     BlurredTextureInfo {
                         texture: pong.clone(),
-                        size: output_size,
+                        size: blur_size,
+                        screen_size: output_size,
                         scale,
                         background_state_hash: 0, // Legacy cache doesn't use hash
                     },
