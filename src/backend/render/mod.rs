@@ -1179,20 +1179,21 @@ impl BlurredBackdropShader {
 
         let shader = Self::get(renderer);
 
-        // Create texture element from the blurred background
-        // Position at element's location, sized to window dimensions
-        let location: Point<f64, Physical> =
-            (element_geo.loc.x as f64, element_geo.loc.y as f64).into();
-
-        // Convert from Local to Logical, then to Physical
-        // Note: The blur texture is always captured in Transform::Normal orientation,
-        // so we don't need to apply output transform here.
+        // Convert from Local to Logical, then to Physical coordinates
+        // The blur texture is captured in physical pixels, so we need physical coordinates
+        // for the src_rect to crop the correct region
         let phys_geo: Rectangle<i32, Physical> =
             element_geo.as_logical().to_physical_precise_round(scale);
 
+        // Position the element at the physical location (scaled from logical)
+        // This is critical for HiDPI: element_geo is in logical coords, but rendering
+        // happens in physical coords
+        let location: Point<f64, Physical> =
+            (phys_geo.loc.x as f64, phys_geo.loc.y as f64).into();
+
         // If transform is not Normal, we need to transform the coordinates
         // Transform affects how coordinates map to the buffer
-        let phys_geo = if transform != Transform::Normal {
+        let transformed_phys_geo = if transform != Transform::Normal {
             // Transform the location within the screen bounds
             let transformed_loc = transform.transform_point_in(phys_geo.loc, &screen_size);
             let transformed_size = transform.transform_size(phys_geo.size);
@@ -1202,48 +1203,26 @@ impl BlurredBackdropShader {
         };
 
         // Calculate src_rect to crop the correct region from the blur texture
-        // src_rect is in Logical coordinates (pixel positions in the source texture)
-        // NOT normalized 0-1 coordinates!
+        // The blur texture is in physical pixel coordinates, so src_rect must be too.
+        // TextureRenderElement interprets src_rect as being in the texture's native
+        // coordinate space (which for our blur texture is physical pixels).
         let src_rect = Rectangle::<f64, Logical>::new(
-            (phys_geo.loc.x as f64, phys_geo.loc.y as f64).into(),
-            (phys_geo.size.w as f64, phys_geo.size.h as f64).into(),
+            (transformed_phys_geo.loc.x as f64, transformed_phys_geo.loc.y as f64).into(),
+            (transformed_phys_geo.size.w as f64, transformed_phys_geo.size.h as f64).into(),
         );
 
-        tracing::debug!(
-            element_x = element_geo.loc.x,
-            element_y = element_geo.loc.y,
-            element_w = element_geo.size.w,
-            element_h = element_geo.size.h,
-            screen_w = screen_size.w,
-            screen_h = screen_size.h,
-            src_rect_x = src_rect.loc.x,
-            src_rect_y = src_rect.loc.y,
-            src_rect_w = src_rect.size.w,
-            src_rect_h = src_rect.size.h,
-            "BlurredBackdropShader::element creating texture element with src_rect (pixel coords)"
-        );
-
-        // Create texture element at window position
-        // TEST: No src_rect - render full texture to see what's in it
-        // This should show the entire blurred background scaled to window size
+        // Output size should be in logical coordinates - this is the size the element
+        // appears on screen. The src_rect crops from physical pixels, but output_size
+        // specifies the logical output dimensions.
         let output_size = Size::<i32, Logical>::from((element_geo.size.w, element_geo.size.h));
+
         let source_elem = TextureRenderElement::from_texture_render_buffer(
             location,
             blurred_texture,
             Some(alpha),
-            Some(src_rect),    // TEST: No cropping - show full texture
-            Some(output_size), // TEST: No size override - use texture size
+            Some(src_rect),
+            Some(output_size),
             Kind::Unspecified,
-        );
-
-        // Debug: Check what geometry the source element reports
-        let geo = source_elem.geometry(1.0.into());
-        tracing::debug!(
-            geo_x = geo.loc.x,
-            geo_y = geo.loc.y,
-            geo_w = geo.size.w,
-            geo_h = geo.size.h,
-            "BlurredBackdropShader source_elem geometry"
         );
 
         TextureShaderElement::new(
@@ -1251,16 +1230,20 @@ impl BlurredBackdropShader {
             shader,
             vec![
                 Uniform::new("alpha", alpha),
+                // Use physical size for shader calculations (corner radius, etc.)
+                // The shader operates in physical pixel space
                 Uniform::new(
                     "size",
-                    [element_geo.size.w as f32, element_geo.size.h as f32],
+                    [phys_geo.size.w as f32, phys_geo.size.h as f32],
                 ),
                 Uniform::new("screen_size", [screen_size.w as f32, screen_size.h as f32]),
+                // Use physical position for shader calculations
                 Uniform::new(
                     "element_pos",
-                    [element_geo.loc.x as f32, element_geo.loc.y as f32],
+                    [phys_geo.loc.x as f32, phys_geo.loc.y as f32],
                 ),
-                Uniform::new("corner_radius", corner_radius),
+                // Scale corner radius to physical pixels
+                Uniform::new("corner_radius", corner_radius * scale as f32),
                 Uniform::new("tint_color", tint_color),
                 Uniform::new("tint_strength", tint_strength),
             ],

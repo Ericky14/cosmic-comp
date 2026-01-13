@@ -1783,32 +1783,36 @@ impl FloatingLayout {
 
         // Collect all windows with their blur status and z-index
         // We need to track non-blur windows to detect gaps between blur windows
-        let all_windows: Vec<(Option<(CosmicMappedKey, Rectangle<i32, Local>, f32)>, usize, bool)> =
-            self.animations
-                .iter()
-                .filter(|(_, anim)| matches!(anim, Animation::Minimize { .. }))
-                .map(|(elem, _)| elem)
-                .chain(self.space.elements().rev())
-                .enumerate()
-                .filter_map(|(front_to_back_idx, elem)| {
-                    let global_z_idx = total_count - 1 - front_to_back_idx;
-                    let has_blur = elem.has_blur();
+        let all_windows: Vec<(
+            Option<(CosmicMappedKey, Rectangle<i32, Local>, f32)>,
+            usize,
+            bool,
+        )> = self
+            .animations
+            .iter()
+            .filter(|(_, anim)| matches!(anim, Animation::Minimize { .. }))
+            .map(|(elem, _)| elem)
+            .chain(self.space.elements().rev())
+            .enumerate()
+            .filter_map(|(front_to_back_idx, elem)| {
+                let global_z_idx = total_count - 1 - front_to_back_idx;
+                let has_blur = elem.has_blur();
 
-                    if has_blur {
-                        let anim_opt = self.animations.get(elem);
-                        let (geometry, elem_alpha) = if let Some(anim) = anim_opt {
-                            (*anim.previous_geometry(), alpha * anim.alpha())
-                        } else {
-                            let geo = self.space.element_geometry(elem)?;
-                            (geo.as_local(), alpha)
-                        };
-                        Some((Some((elem.key(), geometry, elem_alpha)), global_z_idx, true))
+                if has_blur {
+                    let anim_opt = self.animations.get(elem);
+                    let (geometry, elem_alpha) = if let Some(anim) = anim_opt {
+                        (*anim.previous_geometry(), alpha * anim.alpha())
                     } else {
-                        // Non-blur window - we just need to track its position
-                        Some((None, global_z_idx, false))
-                    }
-                })
-                .collect();
+                        let geo = self.space.element_geometry(elem)?;
+                        (geo.as_local(), alpha)
+                    };
+                    Some((Some((elem.key(), geometry, elem_alpha)), global_z_idx, true))
+                } else {
+                    // Non-blur window - we just need to track its position
+                    Some((None, global_z_idx, false))
+                }
+            })
+            .collect();
 
         // Group consecutive blur windows (sorted by z-index, bottom to top)
         let mut groups: Vec<BlurWindowGroup> = Vec::new();
@@ -2160,6 +2164,8 @@ impl FloatingLayout {
                 // Get the output name for looking up cached blur texture
                 let output_name = output.name();
                 let window_key = elem.key();
+                let output_transform = output.current_transform();
+                let output_scale = output.current_scale().fractional_scale();
 
                 // Try per-window blur texture first (for iterative multi-pass blur)
                 // Falls back to global blur texture if per-window not available
@@ -2167,18 +2173,6 @@ impl FloatingLayout {
                     .or_else(|| get_cached_blur_texture(&output_name));
 
                 if let Some(blur_info) = blur_info {
-                    tracing::debug!(
-                        output = %output_name,
-                        window_elements_before = window_elements.len(),
-                        geometry_x = geometry.loc.x,
-                        geometry_y = geometry.loc.y,
-                        geometry_w = geometry.size.w,
-                        geometry_h = geometry.size.h,
-                        texture_w = blur_info.size.w,
-                        texture_h = blur_info.size.h,
-                        corner_radius = corner_radius,
-                        "Creating BlurredBackdropShader element (per-window or global)"
-                    );
                     // Use BlurredBackdropShader with the cached blurred texture
                     // CSS equivalent: background: rgba(255, 255, 255, 0.10); backdrop-filter: blur(50px);
                     let blur_backdrop = BlurredBackdropShader::element(
@@ -2186,8 +2180,8 @@ impl FloatingLayout {
                         &blur_info.texture,
                         geometry,
                         blur_info.size,
-                        output.current_scale().fractional_scale(),
-                        output.current_transform(),
+                        output_scale,
+                        output_transform,
                         corner_radius,
                         alpha,           // Full alpha (window controls visibility)
                         [1.0, 1.0, 1.0], // White tint
@@ -2196,10 +2190,6 @@ impl FloatingLayout {
                     // Push to end = renders first (in back), window content renders on top
                     // Smithay renders elements in reverse order: last element = back, first = front
                     window_elements.push(blur_backdrop.into());
-                    tracing::debug!(
-                        window_elements_after = window_elements.len(),
-                        "Pushed blur backdrop to back"
-                    );
                 } else {
                     tracing::debug!(
                         output = %output_name,
