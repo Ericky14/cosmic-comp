@@ -39,8 +39,11 @@ void main() {
     vec2 texel = 1.0 / tex_size;
     
     // Calculate offset based on blur radius
-    // For 50px blur with ~4 iterations, offset of ~3-4 per pass works well
-    float offset = blur_radius / 12.0;
+    // To avoid tiling artifacts, use smaller offsets with more iterations.
+    // The blur spreads gradually across iterations rather than in large jumps.
+    // With 8 iterations, divisor of 16.0 gives smooth blur matching CSS blur(50px)
+    // Total spread ≈ blur_radius * 8 / 16 * iterations ≈ 50px effective spread
+    float offset = blur_radius / 16.0;
     
     // Kawase blur samples in a diamond/cross pattern
     // This achieves a box-blur-like effect that stacks into Gaussian

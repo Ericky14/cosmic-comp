@@ -123,9 +123,13 @@ pub static GROUP_COLOR: [f32; 3] = [0.788, 0.788, 0.788];
 pub static ACTIVE_GROUP_COLOR: [f32; 3] = [0.58, 0.922, 0.922];
 
 /// Default blur radius in pixels (design spec: blur(50px))
+/// CSS blur(50px) uses a Gaussian blur. Kawase blur approximates this
+/// with multiple iterations. A higher value creates more spread.
 pub const DEFAULT_BLUR_RADIUS: f32 = 50.0;
 /// Number of blur iterations for stronger effect
-pub const BLUR_ITERATIONS: u32 = 4;
+/// More iterations with smaller offsets = smoother blur without tiling artifacts
+/// 8 iterations provides smooth CSS blur(50px) equivalent
+pub const BLUR_ITERATIONS: u32 = 8;
 
 use once_cell::sync::Lazy;
 /// Global cache for blurred textures per window
@@ -1188,8 +1192,7 @@ impl BlurredBackdropShader {
         // Position the element at the physical location (scaled from logical)
         // This is critical for HiDPI: element_geo is in logical coords, but rendering
         // happens in physical coords
-        let location: Point<f64, Physical> =
-            (phys_geo.loc.x as f64, phys_geo.loc.y as f64).into();
+        let location: Point<f64, Physical> = (phys_geo.loc.x as f64, phys_geo.loc.y as f64).into();
 
         // If transform is not Normal, we need to transform the coordinates
         // Transform affects how coordinates map to the buffer
@@ -1207,8 +1210,16 @@ impl BlurredBackdropShader {
         // TextureRenderElement interprets src_rect as being in the texture's native
         // coordinate space (which for our blur texture is physical pixels).
         let src_rect = Rectangle::<f64, Logical>::new(
-            (transformed_phys_geo.loc.x as f64, transformed_phys_geo.loc.y as f64).into(),
-            (transformed_phys_geo.size.w as f64, transformed_phys_geo.size.h as f64).into(),
+            (
+                transformed_phys_geo.loc.x as f64,
+                transformed_phys_geo.loc.y as f64,
+            )
+                .into(),
+            (
+                transformed_phys_geo.size.w as f64,
+                transformed_phys_geo.size.h as f64,
+            )
+                .into(),
         );
 
         // Output size should be in logical coordinates - this is the size the element
@@ -1232,10 +1243,7 @@ impl BlurredBackdropShader {
                 Uniform::new("alpha", alpha),
                 // Use physical size for shader calculations (corner radius, etc.)
                 // The shader operates in physical pixel space
-                Uniform::new(
-                    "size",
-                    [phys_geo.size.w as f32, phys_geo.size.h as f32],
-                ),
+                Uniform::new("size", [phys_geo.size.w as f32, phys_geo.size.h as f32]),
                 Uniform::new("screen_size", [screen_size.w as f32, screen_size.h as f32]),
                 // Use physical position for shader calculations
                 Uniform::new(
