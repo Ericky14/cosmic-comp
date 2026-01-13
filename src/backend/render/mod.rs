@@ -82,8 +82,8 @@ use smithay::{
 use smithay_egui::EguiState;
 
 pub mod animations;
-pub mod clipped_surface;
 pub mod blur;
+pub mod clipped_surface;
 
 pub mod cursor;
 pub mod element;
@@ -324,7 +324,7 @@ pub struct BackdropShader(pub GlesPixelProgram);
 
 #[derive(PartialEq)]
 struct BackdropSettings {
-    radius: f32,
+    corner_radius: [f32; 4],
     alpha: f32,
     color: [f32; 3],
 }
@@ -345,12 +345,12 @@ impl BackdropShader {
         renderer: &R,
         key: impl Into<Key>,
         geo: Rectangle<i32, Local>,
-        radius: f32,
+        corner_radius: [f32; 4],
         alpha: f32,
         color: [f32; 3],
     ) -> PixelShaderElement {
         let settings = BackdropSettings {
-            radius,
+            corner_radius,
             alpha,
             color,
         };
@@ -385,7 +385,10 @@ impl BackdropShader {
                         "color",
                         [color[0] * alpha, color[1] * alpha, color[2] * alpha],
                     ),
-                    Uniform::new("radius", radius),
+                    Uniform::new("corner_radius_tl", corner_radius[0]),
+                    Uniform::new("corner_radius_tr", corner_radius[1]),
+                    Uniform::new("corner_radius_br", corner_radius[2]),
+                    Uniform::new("corner_radius_bl", corner_radius[3]),
                 ],
                 Kind::Unspecified,
             );
@@ -515,7 +518,7 @@ impl BlurredBackdropShader {
     /// * `screen_size` - The full screen size for coordinate mapping
     /// * `scale` - Output scale factor for coordinate conversion
     /// * `transform` - Output transform for coordinate conversion
-    /// * `corner_radius` - Corner radius for rounded rectangle mask
+    /// * `corner_radius` - Corner radii [top-left, top-right, bottom-right, bottom-left]
     /// * `alpha` - Overall opacity
     /// * `tint_color` - Tint overlay color
     /// * `tint_strength` - How much tint to apply (0.0 = none, 1.0 = full)
@@ -527,7 +530,7 @@ impl BlurredBackdropShader {
         screen_size: Size<i32, Physical>,
         scale: f64,
         transform: Transform,
-        corner_radius: f32,
+        corner_radius: [f32; 4],
         alpha: f32,
         tint_color: [f32; 3],
         tint_strength: f32,
@@ -592,6 +595,14 @@ impl BlurredBackdropShader {
             Kind::Unspecified,
         );
 
+        // Scale corner radii to physical pixels
+        let scaled_corner_radius = [
+            corner_radius[0] * scale as f32,
+            corner_radius[1] * scale as f32,
+            corner_radius[2] * scale as f32,
+            corner_radius[3] * scale as f32,
+        ];
+
         TextureShaderElement::new(
             source_elem,
             shader,
@@ -606,8 +617,11 @@ impl BlurredBackdropShader {
                     "element_pos",
                     [phys_geo.loc.x as f32, phys_geo.loc.y as f32],
                 ),
-                // Scale corner radius to physical pixels
-                Uniform::new("corner_radius", corner_radius * scale as f32),
+                // Order: [top-left, top-right, bottom-right, bottom-left]
+                Uniform::new("corner_radius_tl", scaled_corner_radius[0]),
+                Uniform::new("corner_radius_tr", scaled_corner_radius[1]),
+                Uniform::new("corner_radius_br", scaled_corner_radius[2]),
+                Uniform::new("corner_radius_bl", scaled_corner_radius[3]),
                 Uniform::new("tint_color", tint_color),
                 Uniform::new("tint_strength", tint_strength),
             ],
@@ -644,7 +658,10 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
         RECTANGLE_SHADER,
         &[
             UniformName::new("color", UniformType::_3f),
-            UniformName::new("radius", UniformType::_1f),
+            UniformName::new("corner_radius_tl", UniformType::_1f),
+            UniformName::new("corner_radius_tr", UniformType::_1f),
+            UniformName::new("corner_radius_br", UniformType::_1f),
+            UniformName::new("corner_radius_bl", UniformType::_1f),
         ],
     )?;
     let postprocess_shader = renderer.compile_custom_texture_shader(
@@ -698,7 +715,10 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
             UniformName::new("size", UniformType::_2f),
             UniformName::new("screen_size", UniformType::_2f),
             UniformName::new("element_pos", UniformType::_2f),
-            UniformName::new("corner_radius", UniformType::_1f),
+            UniformName::new("corner_radius_tl", UniformType::_1f),
+            UniformName::new("corner_radius_tr", UniformType::_1f),
+            UniformName::new("corner_radius_br", UniformType::_1f),
+            UniformName::new("corner_radius_bl", UniformType::_1f),
             UniformName::new("tint_color", UniformType::_3f),
             UniformName::new("tint_strength", UniformType::_1f),
         ],

@@ -185,6 +185,65 @@ impl CosmicWindowInternal {
     fn has_tiled_state(&self) -> bool {
         self.window.is_tiled(false).unwrap_or(false)
     }
+
+    /// Compute corner radius based on window state, appearance config, and theme.
+    /// This is a helper that can be called from within `with_program` closures.
+    pub fn compute_corner_radius(
+        &self,
+        geometry_size: Size<i32, Logical>,
+        default_radius: u8,
+    ) -> [u8; 4] {
+        let has_ssd = self.has_ssd(false);
+        let is_tiled = self.is_tiled();
+        let is_maximized = self.window.is_maximized(false);
+        let appearance = self.appearance_conf.lock().unwrap();
+
+        let clip = ((!is_tiled && appearance.clip_floating_windows)
+            || (is_tiled && appearance.clip_tiled_windows))
+            && !is_maximized;
+        let round = (!is_tiled || appearance.clip_tiled_windows) && !is_maximized;
+        let radii = round
+            .then(|| {
+                self.theme
+                    .lock()
+                    .unwrap()
+                    .cosmic()
+                    .radius_s()
+                    .map(|x| if x < 4.0 { x } else { x + 4.0 })
+                    .map(|x| x.round() as u8)
+            })
+            .unwrap_or([0; 4]);
+
+        match (has_ssd, clip) {
+            (has_ssd, true) => {
+                let mut corners = self.window.corner_radius(geometry_size).unwrap_or(radii);
+
+                corners[0] = radii[0].max(corners[0]);
+                corners[1] = if has_ssd {
+                    radii[1]
+                } else {
+                    radii[1].max(corners[1])
+                };
+                corners[2] = radii[2].max(corners[2]);
+                corners[3] = if has_ssd {
+                    radii[3]
+                } else {
+                    radii[3].max(corners[3])
+                };
+
+                corners
+            }
+            (true, false) => self
+                .window
+                .corner_radius(geometry_size)
+                .map(|[a, _, c, _]| [a, radii[1], c, radii[3]])
+                .unwrap_or([default_radius, radii[1], default_radius, radii[3]]),
+            (false, false) => self
+                .window
+                .corner_radius(geometry_size)
+                .unwrap_or([default_radius; 4]),
+        }
+    }
 }
 
 impl CosmicWindow {
@@ -372,39 +431,45 @@ impl CosmicWindow {
             let has_ssd = p.has_ssd(false);
             let is_tiled = p.is_tiled();
             let activated = p.window.is_activated(false);
-            let appearance = p.appearance_conf.lock().unwrap();
-            let theme = p.theme.lock().unwrap();
+            let has_blur = p.window.has_blur();
+            let is_maximized = p.window.is_maximized(false);
 
-            if p.window.is_maximized(false) {
+            // Skip shadows for maximized windows
+            if is_maximized {
                 return None;
             }
 
-            let clip = (!is_tiled && appearance.clip_floating_windows)
-                || (is_tiled && appearance.clip_tiled_windows);
-            let should_draw_shadow = if is_tiled {
-                appearance.shadow_tiled_windows
+            // Extract appearance config values we need
+            let (shadow_tiled_windows, clip_floating_windows) = {
+                let appearance = p.appearance_conf.lock().unwrap();
+                (
+                    appearance.shadow_tiled_windows,
+                    appearance.clip_floating_windows,
+                )
+            };
+
+            // Blur windows always get shadows (they're typically overlay-style windows)
+            // For other windows: tiled uses shadow_tiled_windows config, floating uses clip or ssd
+            let should_draw_shadow = if has_blur {
+                true
+            } else if is_tiled {
+                shadow_tiled_windows
             } else {
-                appearance.clip_floating_windows || has_ssd
+                clip_floating_windows || has_ssd
             };
 
             if !should_draw_shadow {
                 return None;
             }
-            let mut radii = theme
-                .cosmic()
-                .radius_s()
-                .map(|x| if x < 4.0 { x } else { x + 4.0 })
-                .map(|x| (x * scale as f32).round() as u8);
-            if has_ssd && !clip {
-                // bottom corners
-                radii[0] = 0;
-                radii[2] = 0;
-                if is_tiled {
-                    // top corners
-                    radii[1] = 0;
-                    radii[3] = 0;
-                }
-            }
+
+            // Get the geometry size for corner radius lookup
+            let geo_size = SpaceElement::geometry(&p.window).size;
+
+            // Use helper function to compute corner radius (avoids code duplication)
+            let radii = p.compute_corner_radius(geo_size, 0);
+
+            // Extract is_dark
+            let is_dark = p.theme.lock().unwrap().cosmic().is_dark;
 
             let mut geo = SpaceElement::geometry(&p.window).to_f64();
             if has_ssd {
@@ -427,7 +492,7 @@ impl CosmicWindow {
                     radii,
                     if activated { alpha } else { alpha * 0.75 },
                     output_scale.x,
-                    theme.cosmic().is_dark,
+                    is_dark,
                 ))
                 .into(),
             )
@@ -623,58 +688,8 @@ impl CosmicWindow {
     }
 
     pub fn corner_radius(&self, geometry_size: Size<i32, Logical>, default_radius: u8) -> [u8; 4] {
-        self.0.with_program(|p| {
-            let has_ssd = p.has_ssd(false);
-            let is_tiled = p.is_tiled();
-            let appearance = p.appearance_conf.lock().unwrap();
-
-            let clip = ((!is_tiled && appearance.clip_floating_windows)
-                || (is_tiled && appearance.clip_tiled_windows))
-                && !p.window.is_maximized(false);
-            let round =
-                (!is_tiled || appearance.clip_tiled_windows) && !p.window.is_maximized(false);
-            let radii = round
-                .then(|| {
-                    p.theme
-                        .lock()
-                        .unwrap()
-                        .cosmic()
-                        .radius_s()
-                        .map(|x| if x < 4.0 { x } else { x + 4.0 })
-                        .map(|x| x.round() as u8)
-                })
-                .unwrap_or([0; 4]);
-
-            match (has_ssd, clip) {
-                (has_ssd, true) => {
-                    let mut corners = p.window.corner_radius(geometry_size).unwrap_or(radii);
-
-                    corners[0] = radii[0].max(corners[0]);
-                    corners[1] = if has_ssd {
-                        radii[1]
-                    } else {
-                        radii[1].max(corners[1])
-                    };
-                    corners[2] = radii[2].max(corners[2]);
-                    corners[3] = if has_ssd {
-                        radii[3]
-                    } else {
-                        radii[3].max(corners[3])
-                    };
-
-                    corners
-                }
-                (true, false) => p
-                    .window
-                    .corner_radius(geometry_size)
-                    .map(|[a, _, c, _]| [a, radii[1], c, radii[3]])
-                    .unwrap_or([default_radius, radii[1], default_radius, radii[3]]),
-                (false, false) => p
-                    .window
-                    .corner_radius(geometry_size)
-                    .unwrap_or([default_radius; 4]),
-            }
-        })
+        self.0
+            .with_program(|p| p.compute_corner_radius(geometry_size, default_radius))
     }
 
     /// Check if this window has KDE blur effect enabled

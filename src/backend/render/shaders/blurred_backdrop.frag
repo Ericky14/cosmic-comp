@@ -16,18 +16,44 @@ uniform sampler2D tex;
 varying vec2 v_coords;
 
 // Custom uniforms
-uniform float alpha;          // Overall opacity
-uniform vec2 size;            // Element size in pixels
-uniform vec2 screen_size;     // Full screen size (unused now, kept for compatibility)
-uniform vec2 element_pos;     // Element position on screen (unused now)
-uniform float corner_radius;  // Corner radius for rounded rect mask
-uniform vec3 tint_color;      // Tint overlay color (e.g., white = 1.0, 1.0, 1.0)
-uniform float tint_strength;  // Tint opacity (0.10 for 10% white overlay)
+uniform float alpha;           // Overall opacity
+uniform vec2 size;             // Element size in pixels
+uniform vec2 screen_size;      // Full screen size (unused now, kept for compatibility)
+uniform vec2 element_pos;      // Element position on screen (unused now)
+uniform float corner_radius_tl;   // Top-left corner radius
+uniform float corner_radius_tr;   // Top-right corner radius
+uniform float corner_radius_br;   // Bottom-right corner radius
+uniform float corner_radius_bl;   // Bottom-left corner radius
+uniform vec3 tint_color;       // Tint overlay color (e.g., white = 1.0, 1.0, 1.0)
+uniform float tint_strength;   // Tint opacity (0.10 for 10% white overlay)
 
-// SDF for rounded box
-float rounded_box(in vec2 p, in vec2 b, in float r) {
-    vec2 q = abs(p) - b + r;
-    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+// Calculate alpha for rounded corners using distance from corner centers
+float rounding_alpha(vec2 coords, vec2 size, float cr_tl, float cr_tr, float cr_br, float cr_bl) {
+    vec2 center;
+    float radius;
+
+    // Top-left corner
+    if (coords.x < cr_tl && coords.y < cr_tl) {
+        radius = cr_tl;
+        center = vec2(radius, radius);
+    // Top-right corner
+    } else if (size.x - cr_tr < coords.x && coords.y < cr_tr) {
+        radius = cr_tr;
+        center = vec2(size.x - radius, radius);
+    // Bottom-right corner
+    } else if (size.x - cr_br < coords.x && size.y - cr_br < coords.y) {
+        radius = cr_br;
+        center = vec2(size.x - radius, size.y - radius);
+    // Bottom-left corner
+    } else if (coords.x < cr_bl && size.y - cr_bl < coords.y) {
+        radius = cr_bl;
+        center = vec2(radius, size.y - radius);
+    } else {
+        return 1.0;
+    }
+
+    float dist = distance(coords, center);
+    return 1.0 - smoothstep(radius - 0.5, radius + 0.5, dist);
 }
 
 void main() {
@@ -35,18 +61,19 @@ void main() {
     vec4 blurred = texture2D(tex, v_coords);
     
     // Apply tint overlay: blend tint_color on top with tint_strength opacity
-    // This mimics: background: rgba(255, 255, 255, 0.10) on top of blurred background
-    // Using standard alpha blending: result = tint * tint_alpha + blurred * (1 - tint_alpha)
     vec3 tinted = mix(blurred.rgb, tint_color, tint_strength);
     
-    // Apply rounded corner mask
-    vec2 half_size = size * 0.5;
-    vec2 pos = (v_coords - 0.5) * size;  // Convert from [0,1] to pixel coords centered at origin
-    float dist = rounded_box(pos, half_size, corner_radius);
+    // v_coords is in full texture space [0,1] representing the whole screen.
+    // Convert to screen pixel coordinates, then to local element coordinates.
+    vec2 screen_pos = v_coords * screen_size;
+    vec2 pixel_coords = screen_pos - element_pos;
     
-    // Soft edge for anti-aliasing (1 pixel fade)
-    float mask = 1.0 - smoothstep(-1.0, 0.0, dist);
+    // Apply rounded corner mask
+    float mask = rounding_alpha(pixel_coords, size, corner_radius_tl, corner_radius_tr, corner_radius_br, corner_radius_bl);
+    
+    // Discard pixels in rounded corners to avoid any artifacts
+    if (mask < 0.01) discard;
     
     // Final output with alpha and corner mask
-    gl_FragColor = vec4(tinted, alpha * mask);
+    gl_FragColor = vec4(tinted, blurred.a * alpha * mask);
 }

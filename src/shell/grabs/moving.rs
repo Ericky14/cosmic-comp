@@ -179,7 +179,7 @@ impl MoveGrabState {
                         renderer,
                         Key::Window(Usage::SnappingIndicator, self.window.key()),
                         t.overlay_geometry(non_exclusive_geometry, gaps),
-                        theme.radius_s()[0], // TODO: Fix once shaders support 4 corner radii customization
+                        theme.radius_s(),
                         0.4,
                         [base_color.red, base_color.green, base_color.blue],
                     )),

@@ -7,7 +7,11 @@ uniform vec2 size;
 varying vec2 v_coords;
 
 uniform vec3 color;
-uniform float radius;
+// Per-corner radii: top_left, top_right, bottom_right, bottom_left
+uniform float corner_radius_tl;
+uniform float corner_radius_tr;
+uniform float corner_radius_br;
+uniform float corner_radius_bl;
 
 float rounded_box(in vec2 p, in vec2 b, in vec4 r)
 {
@@ -21,7 +25,8 @@ void main() {
     vec2 center = size / 2.0;
     vec2 location = v_coords * size;
     vec4 mix_color;
-    vec4 corners = vec4(radius);
+    // Order: top_right, bottom_right, bottom_left, top_left (for rounded_box function)
+    vec4 corners = vec4(corner_radius_tr, corner_radius_br, corner_radius_bl, corner_radius_tl);
 
     float distance = rounded_box(location - center, size / 2.0, corners);
     float smoothedAlpha = 1.0 - smoothstep(0.0, 1.0, distance);

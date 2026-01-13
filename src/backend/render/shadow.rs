@@ -104,9 +104,9 @@ impl ShadowShader {
             // Primary shadow geometry
             let width = softness;
             let sigma = width / 2.;
-            let width = ceil(sigma * 3.);
+            let width = ceil(sigma * 4.);
 
-            let offset = Point::new(ceil(offset[0]), ceil(offset[1]));
+            let offset: Point<f64, Local> = Point::new(ceil(offset[0]), ceil(offset[1]));
             let spread = ceil(spread.abs()).copysign(spread);
             let offset = offset - Point::new(spread, spread);
 
@@ -122,7 +122,7 @@ impl ShadowShader {
             // Secondary shadow geometry
             let width_2 = softness_2;
             let sigma_2 = width_2 / 2.;
-            let width_2 = ceil(sigma_2 * 3.);
+            let width_2 = ceil(sigma_2 * 4.);
 
             let offset_2_point: Point<f64, Local> =
                 Point::new(ceil(offset_2[0]), ceil(offset_2[1]));
@@ -145,14 +145,20 @@ impl ShadowShader {
 
             // Combine shader sizes (use the larger of the two)
             let shader_width = width.max(width_2);
+            // Account for max offset in each direction
+            let max_offset_x = offset.x.abs().max(offset_2.x.abs());
+            let max_offset_y = offset.y.abs().max(offset_2.y.abs());
             let shader_size = geo.size
-                + Size::from((shader_width, shader_width)).upscale(2.)
+                + Size::from((shader_width + max_offset_x, shader_width + max_offset_y))
+                    .upscale(2.)
                 + Size::new(spread.max(spread_2), spread.max(spread_2)).upscale(2.);
-            let mut shader_geo =
-                Rectangle::new(Point::from((-shader_width, -shader_width)), shader_size);
+            let mut shader_geo = Rectangle::new(
+                Point::from((-shader_width - max_offset_x, -shader_width - max_offset_y)),
+                shader_size,
+            );
 
             // Primary shadow transforms
-            let window_geo = Rectangle::new(Point::new(0., 0.) - offset - shader_geo.loc, geo.size);
+            let window_geo = Rectangle::new(Point::new(0., 0.) - shader_geo.loc, geo.size);
             let area_size = Vector2::new(shader_geo.size.w, shader_geo.size.h);
             let geo_loc = Vector2::new(-shader_geo.loc.x + offset.x, -shader_geo.loc.y + offset.y);
 

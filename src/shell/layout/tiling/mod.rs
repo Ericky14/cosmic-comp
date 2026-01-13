@@ -4328,7 +4328,7 @@ fn geometries_for_groupview<'a, R>(
     mouse_tiling: Option<Option<&TargetZone>>,
     swap_desc: Option<NodeDesc>,
     swap_tree: Option<&Tree<Data>>,
-    _theme: &cosmic::theme::CosmicTheme,
+    theme: &cosmic::theme::CosmicTheme,
 ) -> (
     HashMap<NodeId, Rectangle<i32, Local>>,
     Vec<CosmicMappedRenderElement<R>>,
@@ -4661,7 +4661,7 @@ where
                                         *renderer,
                                         backdrop_id.clone(),
                                         pill_geo,
-                                        8.,
+                                        theme.radius_s(),
                                         alpha * 0.4,
                                         group_color,
                                     )
@@ -4680,7 +4680,7 @@ where
                                     *renderer,
                                     Key::Group(Arc::downgrade(alive)),
                                     geo,
-                                    8.,
+                                    theme.radius_s(),
                                     alpha
                                         * if focused
                                             .as_ref()
@@ -4767,7 +4767,7 @@ where
                                                             (geo.loc.x, geo.loc.y - 8).into(),
                                                             (geo.size.w, 16).into(),
                                                         ),
-                                                        8.,
+                                                        theme.radius_s(),
                                                         alpha * 0.4,
                                                         group_color,
                                                     )
@@ -4809,7 +4809,7 @@ where
                                                             (geo.loc.x - 8, geo.loc.y).into(),
                                                             (16, geo.size.h).into(),
                                                         ),
-                                                        8.,
+                                                        theme.radius_s(),
                                                         alpha * 0.4,
                                                         group_color,
                                                     )
@@ -4878,7 +4878,7 @@ where
                                     *renderer,
                                     Key::Window(Usage::OverviewBackdrop, mapped.key()),
                                     geo,
-                                    8.,
+                                    theme.radius_s(),
                                     alpha
                                         * if focused
                                             .as_ref()
@@ -4935,7 +4935,7 @@ where
                                 *renderer,
                                 id.clone(),
                                 geo,
-                                8.,
+                                theme.radius_s(),
                                 alpha * 0.4,
                                 group_color,
                             )
@@ -5322,7 +5322,7 @@ where
                 renderer,
                 backdrop_id.clone(),
                 focused_geo,
-                8.,
+                theme.radius_s(),
                 transition.unwrap_or(1.0) * 0.4,
                 group_color,
             )
@@ -5447,7 +5447,12 @@ where
                                 _ => unreachable!(),
                             },
                             geo,
-                            radius[0] as f32,
+                            [
+                                radius[0] as f32,
+                                radius[1] as f32,
+                                radius[2] as f32,
+                                radius[3] as f32,
+                            ],
                             0.4,
                             group_color,
                         );
@@ -5615,7 +5620,7 @@ where
                             renderer,
                             Key::Window(Usage::Overlay, mapped.key()),
                             active_geo,
-                            0.0,
+                            [0.0; 4],
                             0.3,
                             group_color,
                         )),
@@ -5625,7 +5630,14 @@ where
                 // Add blur backdrop for windows that request KDE blur
                 if mapped.has_blur() {
                     let radius = mapped.corner_radius(geo.size.as_logical(), 8);
-                    let corner_radius = radius[0] as f32;
+                    // Reorder from [bottom_right, top_right, bottom_left, top_left]
+                    // to shader expected order: [top_left, top_right, bottom_right, bottom_left]
+                    let corner_radius = [
+                        radius[3] as f32, // top_left
+                        radius[1] as f32, // top_right
+                        radius[0] as f32, // bottom_right
+                        radius[2] as f32, // bottom_left
+                    ];
                     elements.insert(
                         0,
                         CosmicMappedRenderElement::Overlay(BackdropShader::element(

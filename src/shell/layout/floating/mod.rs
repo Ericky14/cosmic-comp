@@ -2202,8 +2202,21 @@ impl FloatingLayout {
             // Design spec: background: rgba(255, 255, 255, 0.10), backdrop-filter: blur(50px)
             // Skip adding backdrop if we're capturing background for blur
             if elem.has_blur() && blur_ctx.is_none() {
-                let radius = elem.corner_radius(geometry.size.as_logical(), 8);
-                let corner_radius = radius[0] as f32;
+                // Use 0 corner radius for maximized windows (no rounded corners when fullscreen)
+                let corner_radius = if elem.is_maximized(false) {
+                    [0.0f32; 4]
+                } else {
+                    let radius = elem.corner_radius(geometry.size.as_logical(), 8);
+                    // Convert corner radii to f32 for shader
+                    // Reorder from [bottom_right, top_right, bottom_left, top_left]
+                    // to shader expected order: [top_left, top_right, bottom_right, bottom_left]
+                    [
+                        radius[3] as f32, // top_left
+                        radius[1] as f32, // top_right
+                        radius[0] as f32, // bottom_right
+                        radius[2] as f32, // bottom_left
+                    ]
+                };
 
                 // Get the output name for looking up cached blur texture
                 let output_name = output.name();
@@ -2235,6 +2248,7 @@ impl FloatingLayout {
                         output = %output_name,
                         "No cached blur texture available, using fallback"
                     );
+                    // Fallback
                     let blur_backdrop = BackdropShader::element(
                         renderer,
                         Key::Window(Usage::Overlay, elem.key()),

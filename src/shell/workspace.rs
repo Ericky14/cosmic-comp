@@ -1792,7 +1792,7 @@ impl Workspace {
                         renderer,
                         self.backdrop_id.clone(),
                         Rectangle::from_size(self.output.geometry().size.as_local()),
-                        0.,
+                        [0.0; 4],
                         alpha * 0.85,
                         [0.0, 0.0, 0.0],
                     ))
