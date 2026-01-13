@@ -5,10 +5,11 @@ use crate::{
         BLUR_ITERATIONS, BlurRenderState, BlurredTextureInfo, CLEAR_COLOR, CursorMode,
         ElementFilter, GlMultiError, GlMultiRenderer, PostprocessOutputConfig, PostprocessShader,
         PostprocessState, apply_blur_passes, cache_blur_texture, cache_blur_texture_for_window,
-        clear_exclude_z_threshold,
+        clear_exclude_z_threshold, compute_element_content_hash,
         element::{CosmicElement, DamageElement},
-        init_shaders, output_elements, set_exclude_z_threshold, set_grabbed_window,
-        set_skip_blur_backdrops, workspace_elements,
+        get_blur_group_content_hash, get_cached_blur_texture_for_window, init_shaders,
+        output_elements, set_exclude_z_threshold, set_grabbed_window, set_skip_blur_backdrops,
+        store_blur_group_content_hash, workspace_elements,
     },
     config::ScreenFilter,
     shell::{Shell, grabs::SeatMoveGrabState},
@@ -1146,6 +1147,7 @@ impl SurfaceThreadState {
 
                     if let Some((previous_workspace, workspace)) = workspace_info {
                         // Process each blur group
+                        // OPTIMIZATION: Skip re-blurring if background hasn't changed
                         let mut any_blur_applied = false;
                         for (group_idx, group) in blur_groups.iter().enumerate() {
                             let _group_span = tracing::info_span!(
@@ -1192,6 +1194,45 @@ impl SurfaceThreadState {
                                     continue;
                                 }
                             };
+
+                            // Compute content hash for cache invalidation
+                            // This includes element IDs (which change on content updates) and geometry
+                            let content_hash = compute_element_content_hash(
+                                group.capture_z_threshold,
+                                &capture_elements,
+                                scale,
+                            );
+
+                            // Check if content has changed since last blur
+                            let stored_hash = get_blur_group_content_hash(&output_name, group.capture_z_threshold);
+                            let content_changed = stored_hash.is_none() || stored_hash != Some(content_hash);
+
+                            // Also verify all windows have cached textures
+                            let all_cached = group.windows.iter().all(|(window_key, _, _, _)| {
+                                get_cached_blur_texture_for_window(&output_name, window_key).is_some()
+                            });
+
+                            let can_reuse_cache = !content_changed && all_cached;
+
+                            if can_reuse_cache {
+                                tracing::debug!(
+                                    group = group_idx,
+                                    windows = group.windows.len(),
+                                    "Skipping blur - cache valid (content unchanged)"
+                                );
+                                any_blur_applied = true;
+                                continue;
+                            }
+
+                            tracing::debug!(
+                                group = group_idx,
+                                content_changed = content_changed,
+                                all_cached = all_cached,
+                                "Re-blurring group"
+                            );
+
+                            // Store the new content hash after we commit to re-blurring
+                            store_blur_group_content_hash(&output_name, group.capture_z_threshold, content_hash);
 
                             // Render captured elements to background texture
                             let bg_render_ok = {
@@ -1274,6 +1315,7 @@ impl SurfaceThreadState {
                                                     texture: pong.clone(),
                                                     size: output_size,
                                                     scale,
+                                                    background_state_hash: content_hash,
                                                 },
                                             );
                                         }
@@ -1295,6 +1337,7 @@ impl SurfaceThreadState {
                                         texture: pong.clone(),
                                         size: output_size,
                                         scale,
+                                        background_state_hash: 0,
                                     },
                                 );
                             }

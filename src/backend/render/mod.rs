@@ -61,6 +61,7 @@ use smithay::{
             glow::GlowRenderer,
             multigpu::{Error as MultiError, MultiFrame, MultiRenderer},
             sync::SyncPoint,
+            utils::CommitCounter,
         },
     },
     input::Seat,
@@ -149,6 +150,9 @@ pub struct BlurredTextureInfo {
     pub size: Size<i32, Physical>,
     /// Scale factor
     pub scale: Scale<f64>,
+    /// Hash of background state for cache invalidation
+    /// Changes when windows below move/resize or z-order changes
+    pub background_state_hash: u64,
 }
 
 /// Cache key combining output name and window key hash
@@ -163,6 +167,70 @@ pub static BLUR_TEXTURE_CACHE: Lazy<RwLock<HashMap<BlurCacheKey, BlurredTextureI
 /// Legacy: Global cache for single blur texture per output (fallback)
 pub static BLUR_TEXTURE_CACHE_LEGACY: Lazy<RwLock<HashMap<String, BlurredTextureInfo>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Cache key for blur group content state: (output_name, capture_z_threshold)
+type BlurGroupContentKey = (String, usize);
+
+/// Tracks the last known content state for blur groups
+/// Used to detect when elements have changed (via their commit counter)
+pub static BLUR_GROUP_CONTENT_STATE: Lazy<RwLock<HashMap<BlurGroupContentKey, u64>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Compute a hash of element content state (commit counters + geometry)
+/// Commit counters change when surfaces commit new content (terminal updates, etc.)
+pub fn compute_element_content_hash<E: Element>(
+    z_threshold: usize,
+    elements: &[E],
+    scale: Scale<f64>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+    // Include z-threshold
+    z_threshold.hash(&mut hasher);
+
+    // Include element count
+    elements.len().hash(&mut hasher);
+
+    // Include each element's commit counter (changes on content update) and geometry
+    for elem in elements {
+        // Element ID for identity
+        let id = elem.id();
+        id.hash(&mut hasher);
+
+        // Commit counter - THIS changes when surface content updates
+        // CommitCounter doesn't implement Hash, so we use Debug format
+        let commit = elem.current_commit();
+        format!("{:?}", commit).hash(&mut hasher);
+
+        // Also include geometry
+        let geo = elem.geometry(scale);
+        geo.loc.x.hash(&mut hasher);
+        geo.loc.y.hash(&mut hasher);
+        geo.size.w.hash(&mut hasher);
+        geo.size.h.hash(&mut hasher);
+    }
+
+    hasher.finish()
+}
+
+/// Get the stored content hash for a blur group
+pub fn get_blur_group_content_hash(output_name: &str, capture_z_threshold: usize) -> Option<u64> {
+    let key = (output_name.to_string(), capture_z_threshold);
+    if let Ok(cache) = BLUR_GROUP_CONTENT_STATE.read() {
+        cache.get(&key).copied()
+    } else {
+        None
+    }
+}
+
+/// Store the content hash for a blur group after rendering
+pub fn store_blur_group_content_hash(output_name: &str, capture_z_threshold: usize, hash: u64) {
+    let key = (output_name.to_string(), capture_z_threshold);
+    if let Ok(mut cache) = BLUR_GROUP_CONTENT_STATE.write() {
+        cache.insert(key, hash);
+    }
+}
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -259,6 +327,56 @@ fn window_key_hash(key: &CosmicMappedKey) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Compute a hash of the background state for blur cache invalidation
+/// This hash changes when:
+/// - The z-threshold changes (different windows visible)
+/// - Any element's geometry changes (position/size)
+/// - Element count changes
+pub fn compute_background_state_hash<E: Element>(
+    z_threshold: usize,
+    elements: &[E],
+    scale: Scale<f64>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+    // Include z-threshold
+    z_threshold.hash(&mut hasher);
+
+    // Include element count
+    elements.len().hash(&mut hasher);
+
+    // Include each element's geometry (position + size)
+    for elem in elements {
+        let geo = elem.geometry(scale);
+        geo.loc.x.hash(&mut hasher);
+        geo.loc.y.hash(&mut hasher);
+        geo.size.w.hash(&mut hasher);
+        geo.size.h.hash(&mut hasher);
+    }
+
+    hasher.finish()
+}
+
+/// Check if any elements have damage since last commit
+/// Returns true if ANY element reports damage (content changed)
+/// NOTE: Passing None for commit returns ALL damage, so this should be used
+/// with a stored CommitCounter for accurate "since last blur" checking.
+#[allow(dead_code)]
+pub fn elements_have_damage<E: Element>(
+    elements: &[E],
+    scale: Scale<f64>,
+    commit: Option<CommitCounter>,
+) -> bool {
+    for elem in elements {
+        let damage = elem.damage_since(scale, commit);
+        if !damage.is_empty() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Store a blurred texture for a specific window on an output
@@ -2462,15 +2580,9 @@ where
         }
 
         // Optimized iterative blur: one capture per GROUP, then blur for each window in group
+        // OPTIMIZATION: Skip re-blurring if background hasn't changed (no damage + same geometry)
         let mut any_blur_applied = false;
         for group in &blur_groups {
-            tracing::debug!(
-                capture_z_threshold = group.capture_z_threshold,
-                windows_in_group = group.windows.len(),
-                "Capturing blur for group (single capture for {} windows)",
-                group.windows.len()
-            );
-
             // Set z-index threshold for the ENTIRE group (use the lowest z-index)
             // All windows in this group see the same "below content"
             set_exclude_z_threshold(group.capture_z_threshold);
@@ -2493,6 +2605,43 @@ where
             clear_exclude_z_threshold();
             set_skip_blur_backdrops(false);
 
+            // Compute content hash for cache invalidation
+            // This includes element IDs (which change on content updates) and geometry
+            let content_hash =
+                compute_element_content_hash(group.capture_z_threshold, &capture_elements, scale);
+
+            // Check if content has changed since last blur
+            let stored_hash = get_blur_group_content_hash(&output_name, group.capture_z_threshold);
+            let content_changed = stored_hash.is_none() || stored_hash != Some(content_hash);
+
+            // Also verify all windows have cached textures
+            let all_cached = group.windows.iter().all(|(window_key, _, _, _)| {
+                get_cached_blur_texture_for_window(&output_name, window_key).is_some()
+            });
+
+            let can_reuse_cache = !content_changed && all_cached;
+
+            if can_reuse_cache {
+                tracing::debug!(
+                    capture_z_threshold = group.capture_z_threshold,
+                    windows_in_group = group.windows.len(),
+                    "Skipping blur for group - cache valid (content unchanged)"
+                );
+                any_blur_applied = true; // Cached textures are still valid
+                continue;
+            }
+
+            tracing::debug!(
+                capture_z_threshold = group.capture_z_threshold,
+                windows_in_group = group.windows.len(),
+                content_changed = content_changed,
+                all_cached = all_cached,
+                "Re-blurring group"
+            );
+
+            // Store the new content hash after we commit to re-blurring
+            store_blur_group_content_hash(&output_name, group.capture_z_threshold, content_hash);
+
             // Render captured elements to background texture (once per group)
             let bg_render_ok = if let Some(bg_texture) = blur_state.background_texture.as_mut() {
                 let mut blur_dt = OutputDamageTracker::new(output_size, scale, Transform::Normal);
@@ -2510,7 +2659,6 @@ where
                             &capture_elements,
                             CLEAR_COLOR,
                         );
-
                         match res {
                             Ok(_) => Ok(Vec::new()),
                             Err(e) => Err(e.into()),
@@ -2553,6 +2701,7 @@ where
                                     texture: pong.clone(),
                                     size: output_size,
                                     scale,
+                                    background_state_hash: content_hash,
                                 },
                             );
                             tracing::debug!(
@@ -2570,7 +2719,6 @@ where
                 }
             }
         }
-
         set_grabbed_window(None); // Clear grabbed window after all captures
         blur_state.blur_applied = any_blur_applied;
 
@@ -2584,6 +2732,7 @@ where
                         texture: pong.clone(),
                         size: output_size,
                         scale,
+                        background_state_hash: 0, // Legacy cache doesn't use hash
                     },
                 );
             }
