@@ -665,15 +665,23 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
     let shadow_shader = renderer.compile_custom_pixel_shader(
         SHADOW_SHADER,
         &[
+            // Primary shadow uniforms
             UniformName::new("shadow_color", UniformType::_4f),
             UniformName::new("sigma", UniformType::_1f),
             UniformName::new("input_to_geo", UniformType::Matrix3x3),
             UniformName::new("geo_size", UniformType::_2f),
             UniformName::new("corner_radius", UniformType::_4f),
+            // Secondary shadow uniforms
+            UniformName::new("shadow_color_2", UniformType::_4f),
+            UniformName::new("sigma_2", UniformType::_1f),
+            UniformName::new("input_to_geo_2", UniformType::Matrix3x3),
+            UniformName::new("geo_size_2", UniformType::_2f),
+            UniformName::new("corner_radius_2", UniformType::_4f),
+            // Window cutout uniforms
             UniformName::new("window_input_to_geo", UniformType::Matrix3x3),
             UniformName::new("window_geo_size", UniformType::_2f),
             UniformName::new("window_corner_radius", UniformType::_4f),
-            ],
+        ],
     )?;
     let blur_shader = renderer.compile_custom_texture_shader(
         BLUR_SHADER,
@@ -712,6 +720,8 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
     egl_context
         .user_data()
         .insert_if_missing(|| ShadowShader(shadow_shader));
+    egl_context
+        .user_data()
         .insert_if_missing(|| BlurShader(blur_shader));
     egl_context
         .user_data()

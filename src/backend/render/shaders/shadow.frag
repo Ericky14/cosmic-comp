@@ -10,10 +10,15 @@ uniform float tint;
 
 uniform vec4 shadow_color;
 uniform float sigma;
-
 uniform mat3 input_to_geo;
 uniform vec2 geo_size;
 uniform vec4 corner_radius;
+
+uniform vec4 shadow_color_2;
+uniform float sigma_2;
+uniform mat3 input_to_geo_2;
+uniform vec2 geo_size_2;
+uniform vec4 corner_radius_2;
 
 uniform mat3 window_input_to_geo;
 uniform vec2 window_geo_size;
@@ -96,13 +101,12 @@ float rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius) {
 
 void main() {
     vec3 coords_geo = input_to_geo * vec3(v_coords, 1.0);
+    vec3 coords_geo_2 = input_to_geo_2 * vec3(v_coords, 1.0);
     vec3 coords_window_geo = window_input_to_geo * vec3(v_coords, 1.0);
 
     vec4 color = shadow_color;
-
     float shadow_value;
     if (sigma < 0.1) {
-        // With low enough sigma just draw a rounded rectangle.
         shadow_value = rounding_alpha(coords_geo.xy, geo_size, corner_radius);
     } else {
         shadow_value = roundedBoxShadow(
@@ -110,14 +114,32 @@ void main() {
                 geo_size,
                 coords_geo.xy,
                 sigma,
-                // FIXME: figure out how to blur with different corner radii.
-                //
-                // GTK seems to call blurring separately for the rect and for the 4 corners:
-                // https://gitlab.gnome.org/GNOME/gtk/-/blob/gtk-4-16/gsk/gpu/shaders/gskgpuboxshadow.glsl
                 corner_radius.z
             );
     }
     color = color * shadow_value;
+
+    // Secondary shadow (smaller blur, e.g. blur 5, alpha 0.02)
+    vec4 color_2 = shadow_color_2;
+    float shadow_value_2;
+    if (sigma_2 < 0.1) {
+        shadow_value_2 = rounding_alpha(coords_geo_2.xy, geo_size_2, corner_radius_2);
+    } else {
+        shadow_value_2 = roundedBoxShadow(
+                vec2(0.0, 0.0),
+                geo_size_2,
+                coords_geo_2.xy,
+                sigma_2,
+                corner_radius_2.z
+            );
+    }
+    color_2 = color_2 * shadow_value_2;
+
+    // Blend the two shadows (additive blending, clamped)
+    color = vec4(
+        min(color.rgb + color_2.rgb, vec3(1.0)),
+        min(color.a + color_2.a, 1.0)
+    );
 
     // Cut out the inside of the window geometry if requested.
     if (window_geo_size != vec2(0.0, 0.0)) {
