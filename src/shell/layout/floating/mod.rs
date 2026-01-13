@@ -25,11 +25,14 @@ use smithay::{
 };
 
 use crate::{
-    backend::render::{IndicatorShader, Key, Usage, element::AsGlowRenderer},
+    backend::render::{
+        BackdropShader, BlurredBackdropShader, ElementFilter, IndicatorShader, Key, Usage,
+        element::AsGlowRenderer, get_cached_blur_texture_for_window,
+    },
     shell::{
         CosmicSurface, Direction, ManagedLayer, MoveResult, ResizeMode,
         element::{
-            CosmicMapped, CosmicMappedRenderElement, CosmicWindow, MaximizedState,
+            CosmicMapped, CosmicMappedKey, CosmicMappedRenderElement, CosmicWindow, MaximizedState,
             resize_indicator::ResizeIndicator,
             stack::{CosmicStackRenderElement, MoveResult as StackMoveResult, TAB_HEIGHT},
             window::CosmicWindowRenderElement,
@@ -50,6 +53,14 @@ pub use self::grabs::*;
 
 pub const ANIMATION_DURATION: Duration = Duration::from_millis(200);
 pub const MINIMIZE_ANIMATION_DURATION: Duration = Duration::from_millis(320);
+
+// Blur backdrop styling constants
+// CSS equivalent: background: rgba(255, 255, 255, 0.10); backdrop-filter: blur(50px)
+const BLUR_TINT_COLOR: [f32; 3] = [1.0, 1.0, 1.0];
+const BLUR_TINT_STRENGTH: f32 = 0.10;
+// Fallback when blur texture not available
+const BLUR_FALLBACK_ALPHA: f32 = 0.25;
+const BLUR_FALLBACK_COLOR: [f32; 3] = [0.9, 0.9, 0.95];
 
 #[derive(Debug, Default)]
 pub struct FloatingLayout {
@@ -345,6 +356,16 @@ impl TiledCorners {
 
         Rectangle::new(loc, size).as_local()
     }
+}
+
+/// A group of consecutive blur windows that can share a single background capture.
+/// Windows are grouped when there are no non-blur windows between them.
+#[derive(Clone)]
+pub struct BlurWindowGroup {
+    /// The z-index threshold for capturing (lowest z-index in the group)
+    pub capture_z_threshold: usize,
+    /// Windows in this group: (key, geometry, alpha, z_index)
+    pub windows: Vec<(CosmicMappedKey, Rectangle<i32, Local>, f32, usize)>,
 }
 
 impl FloatingLayout {
@@ -1701,6 +1722,201 @@ impl FloatingLayout {
         }
         self.refresh(); //fixup any out of bounds elements
     }
+
+    /// Check if any windows in this layout have blur enabled
+    pub fn has_blur_windows(&self) -> bool {
+        let count = self.space.elements().filter(|elem| elem.has_blur()).count();
+        if count > 0 {
+            tracing::debug!(blur_window_count = count, "FloatingLayout has blur windows");
+        }
+        count > 0
+    }
+
+    /// Get blur windows in Z-order (bottom to top) with their keys
+    /// Returns (window_key, geometry, alpha, global_z_index) tuples
+    /// global_z_index is the position among ALL windows where 0 = bottom and N-1 = top
+    pub fn blur_windows_ordered(
+        &self,
+        alpha: f32,
+    ) -> Vec<(CosmicMappedKey, Rectangle<i32, Local>, f32, usize)> {
+        if self.space.outputs().next().is_none() {
+            return Vec::new();
+        }
+
+        // Count minimizing animations and space elements to get total window count
+        let minimizing_count = self
+            .animations
+            .iter()
+            .filter(|(_, anim)| matches!(anim, Animation::Minimize { .. }))
+            .count();
+        let total_count = minimizing_count + self.space.elements().count();
+
+        if total_count == 0 {
+            return Vec::new();
+        }
+
+        self.animations
+            .iter()
+            .filter(|(_, anim)| matches!(anim, Animation::Minimize { .. }))
+            .map(|(elem, _)| elem)
+            .chain(self.space.elements().rev())
+            .enumerate()
+            .filter(|(_, elem)| elem.has_blur())
+            .filter_map(|(front_to_back_idx, elem)| {
+                // Convert front-to-back index to back-to-front z-index
+                // Index 0 in iteration = topmost window = z-index (total-1)
+                // Index (total-1) in iteration = bottom window = z-index 0
+                let global_z_idx = total_count - 1 - front_to_back_idx;
+
+                let anim_opt = self.animations.get(elem);
+                let (geometry, elem_alpha) = if let Some(anim) = anim_opt {
+                    (*anim.previous_geometry(), alpha * anim.alpha())
+                } else {
+                    let geo = self.space.element_geometry(elem)?;
+                    (geo.as_local(), alpha)
+                };
+                Some((elem.key(), geometry, elem_alpha, global_z_idx))
+            })
+            .collect()
+    }
+
+    /// Get blur windows grouped by shared capture requirements.
+    /// Consecutive blur windows (no non-blur windows between them) share a capture.
+    /// This optimizes rendering by reducing the number of scene captures needed.
+    ///
+    /// Example:
+    /// - Windows: [non-blur z=0, blur z=1, blur z=2, non-blur z=3, blur z=4]
+    /// - Groups: [{threshold=1, windows=[z=1,z=2]}, {threshold=4, windows=[z=4]}]
+    /// - Only 2 captures needed instead of 3
+    pub fn blur_windows_grouped(&self, alpha: f32) -> Vec<BlurWindowGroup> {
+        if self.space.outputs().next().is_none() {
+            return Vec::new();
+        }
+
+        // Count minimizing animations and space elements to get total window count
+        let minimizing_count = self
+            .animations
+            .iter()
+            .filter(|(_, anim)| matches!(anim, Animation::Minimize { .. }))
+            .count();
+        let total_count = minimizing_count + self.space.elements().count();
+
+        if total_count == 0 {
+            return Vec::new();
+        }
+
+        // Collect all windows with their blur status and z-index
+        // We need to track non-blur windows to detect gaps between blur windows
+        let all_windows: Vec<(
+            Option<(CosmicMappedKey, Rectangle<i32, Local>, f32)>,
+            usize,
+            bool,
+        )> = self
+            .animations
+            .iter()
+            .filter(|(_, anim)| matches!(anim, Animation::Minimize { .. }))
+            .map(|(elem, _)| elem)
+            .chain(self.space.elements().rev())
+            .enumerate()
+            .filter_map(|(front_to_back_idx, elem)| {
+                let global_z_idx = total_count - 1 - front_to_back_idx;
+                let has_blur = elem.has_blur();
+
+                if has_blur {
+                    let anim_opt = self.animations.get(elem);
+                    let (geometry, elem_alpha) = if let Some(anim) = anim_opt {
+                        (*anim.previous_geometry(), alpha * anim.alpha())
+                    } else {
+                        let geo = self.space.element_geometry(elem)?;
+                        (geo.as_local(), alpha)
+                    };
+                    Some((Some((elem.key(), geometry, elem_alpha)), global_z_idx, true))
+                } else {
+                    // Non-blur window - we just need to track its position
+                    Some((None, global_z_idx, false))
+                }
+            })
+            .collect();
+
+        // Group consecutive blur windows (sorted by z-index, bottom to top)
+        let mut groups: Vec<BlurWindowGroup> = Vec::new();
+        let mut current_group: Option<BlurWindowGroup> = None;
+        let mut last_z_idx: Option<usize> = None;
+
+        // Sort by z-index (ascending = bottom to top)
+        let mut sorted_windows = all_windows;
+        sorted_windows.sort_by_key(|(_, z_idx, _)| *z_idx);
+
+        for (window_data, z_idx, is_blur) in sorted_windows {
+            if is_blur {
+                if let Some((key, geometry, elem_alpha)) = window_data {
+                    // Check if this blur window is consecutive with the previous
+                    let is_consecutive = last_z_idx.map(|last| z_idx == last + 1).unwrap_or(true);
+
+                    if is_consecutive {
+                        // Add to current group or start new one
+                        if let Some(ref mut group) = current_group {
+                            group.windows.push((key, geometry, elem_alpha, z_idx));
+                        } else {
+                            current_group = Some(BlurWindowGroup {
+                                capture_z_threshold: z_idx,
+                                windows: vec![(key, geometry, elem_alpha, z_idx)],
+                            });
+                        }
+                    } else {
+                        // Gap detected - finish current group and start new one
+                        if let Some(group) = current_group.take() {
+                            groups.push(group);
+                        }
+                        current_group = Some(BlurWindowGroup {
+                            capture_z_threshold: z_idx,
+                            windows: vec![(key, geometry, elem_alpha, z_idx)],
+                        });
+                    }
+                }
+            } else {
+                // Non-blur window creates a gap - finish current group
+                if let Some(group) = current_group.take() {
+                    groups.push(group);
+                }
+            }
+            last_z_idx = Some(z_idx);
+        }
+
+        // Don't forget the last group
+        if let Some(group) = current_group {
+            groups.push(group);
+        }
+
+        groups
+    }
+
+    /// Get the geometries of all windows that have blur enabled
+    /// Returns (geometry, alpha) tuples
+    pub fn blur_window_geometries(&self, alpha: f32) -> Vec<(Rectangle<i32, Local>, f32)> {
+        if self.space.outputs().next().is_none() {
+            return Vec::new();
+        }
+
+        self.animations
+            .iter()
+            .filter(|(_, anim)| matches!(anim, Animation::Minimize { .. }))
+            .map(|(elem, _)| elem)
+            .chain(self.space.elements().rev())
+            .filter(|elem| elem.has_blur())
+            .filter_map(|elem| {
+                let anim_opt = self.animations.get(elem);
+                let (geometry, elem_alpha) = if let Some(anim) = anim_opt {
+                    (*anim.previous_geometry(), alpha * anim.alpha())
+                } else {
+                    let geo = self.space.element_geometry(elem)?;
+                    (geo.as_local(), alpha)
+                };
+                Some((geometry, elem_alpha))
+            })
+            .collect()
+    }
+
     #[profiling::function]
     pub fn render_popups<R>(
         &self,
@@ -1757,6 +1973,7 @@ impl FloatingLayout {
         indicator_thickness: u8,
         alpha: f32,
         theme: &cosmic::theme::CosmicTheme,
+        element_filter: ElementFilter,
     ) -> Vec<CosmicMappedRenderElement<R>>
     where
         R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
@@ -1774,13 +1991,86 @@ impl FloatingLayout {
 
         let mut elements = Vec::default();
 
-        for elem in self
+        // Extract blur capture context if present
+        let blur_ctx = match &element_filter {
+            ElementFilter::BlurCapture(ctx) => Some(ctx),
+            _ => None,
+        };
+
+        // Debug: Log how many windows are in the space during blur capture
+        if blur_ctx.is_some() {
+            let window_count = self.space.elements().count();
+            let window_list: Vec<_> = self
+                .space
+                .elements()
+                .map(|e| e.active_window().app_id())
+                .collect();
+            tracing::debug!(
+                window_count = window_count,
+                windows = ?window_list,
+                "Blur capture: iterating windows in space"
+            );
+        }
+
+        // Count total windows for z-index calculation
+        let minimizing_count = self
+            .animations
+            .iter()
+            .filter(|(_, anim)| matches!(anim, Animation::Minimize { .. }))
+            .count();
+        let total_window_count = minimizing_count + self.space.elements().count();
+
+        // Iterate front-to-back (topmost first) using enumerate to track iteration index
+        for (front_to_back_idx, elem) in self
             .animations
             .iter()
             .filter(|(_, anim)| matches!(anim, Animation::Minimize { .. }))
             .map(|(elem, _)| elem)
             .chain(self.space.elements().rev())
+            .enumerate()
         {
+            // Convert front-to-back index to back-to-front z-index
+            // Index 0 in iteration = topmost window = z-index (total-1)
+            // Index (total-1) in iteration = bottom window = z-index 0
+            let z_idx = if total_window_count > 0 {
+                total_window_count - 1 - front_to_back_idx
+            } else {
+                0
+            };
+
+            // When capturing background for blur (iterative multi-pass):
+            // - Skip grabbed/dragged windows (they're rendered on top and shouldn't blur themselves)
+            // - Skip windows at or above the z-index threshold (blur window and everything above)
+            // - For final render (not skipping backdrops), render all windows normally
+            if let Some(ctx) = blur_ctx {
+                // Skip grabbed/dragged window - it's always on top
+                if ctx.is_window_grabbed(elem) {
+                    tracing::debug!(
+                        window_class = %elem.active_window().app_id(),
+                        z_idx = z_idx,
+                        "Skipping grabbed window during blur capture"
+                    );
+                    continue;
+                }
+
+                // Check if this window is at or above the z-index threshold
+                if ctx.is_z_index_excluded(z_idx) {
+                    tracing::debug!(
+                        window_class = %elem.active_window().app_id(),
+                        z_idx = z_idx,
+                        "Excluding window during blur capture (z-index threshold)"
+                    );
+                    continue;
+                }
+
+                // This window WILL be rendered in blur capture
+                tracing::debug!(
+                    window_class = %elem.active_window().app_id(),
+                    z_idx = z_idx,
+                    "Including window in blur capture"
+                );
+            }
+
             let anim_opt = self.animations.get(elem);
             let (mut geometry, alpha) = anim_opt
                 .map(|anim| {
@@ -1905,6 +2195,55 @@ impl FloatingLayout {
                     // using client_driven_geometry(). No buffer rescaling or relocation
                     // needed - the client renders at the animated size and we already
                     // positioned it at the animated location.
+                }
+            }
+
+            // Add blur backdrop for windows that request KDE blur (independent of focus state)
+            // Design spec: background: rgba(255, 255, 255, 0.10), backdrop-filter: blur(50px)
+            // Skip adding backdrop if we're capturing background for blur
+            if elem.has_blur() && blur_ctx.is_none() {
+                let radius = elem.corner_radius(geometry.size.as_logical(), 8);
+                let corner_radius = radius[0] as f32;
+
+                // Get the output name for looking up cached blur texture
+                let output_name = output.name();
+                let window_key = elem.key();
+                let output_transform = output.current_transform();
+                let output_scale = output.current_scale().fractional_scale();
+
+                // Get per-window blur texture (iterative multi-pass blur)
+                let blur_info = get_cached_blur_texture_for_window(&output_name, &window_key);
+
+                if let Some(blur_info) = blur_info {
+                    // Use BlurredBackdropShader with the cached blurred texture
+                    let blur_backdrop = BlurredBackdropShader::element(
+                        renderer,
+                        &blur_info.texture,
+                        geometry,
+                        blur_info.size,
+                        blur_info.screen_size,
+                        output_scale,
+                        output_transform,
+                        corner_radius,
+                        alpha,
+                        BLUR_TINT_COLOR,
+                        BLUR_TINT_STRENGTH,
+                    );
+                    window_elements.push(blur_backdrop.into());
+                } else {
+                    tracing::debug!(
+                        output = %output_name,
+                        "No cached blur texture available, using fallback"
+                    );
+                    let blur_backdrop = BackdropShader::element(
+                        renderer,
+                        Key::Window(Usage::Overlay, elem.key()),
+                        geometry,
+                        corner_radius,
+                        alpha * BLUR_FALLBACK_ALPHA,
+                        BLUR_FALLBACK_COLOR,
+                    );
+                    window_elements.push(blur_backdrop.into());
                 }
             }
 

@@ -79,6 +79,10 @@ pub use self::grabs::*;
 
 pub const ANIMATION_DURATION: Duration = Duration::from_millis(200);
 pub const MINIMIZE_ANIMATION_DURATION: Duration = Duration::from_millis(320);
+
+// Blur backdrop fallback styling (when blur texture not available)
+const BLUR_FALLBACK_ALPHA: f32 = 0.25;
+const BLUR_FALLBACK_COLOR: [f32; 3] = [0.9, 0.9, 0.95];
 pub const MOUSE_ANIMATION_DELAY: Duration = Duration::from_millis(150);
 pub const INITIAL_MOUSE_ANIMATION_DELAY: Duration = Duration::from_millis(500);
 
@@ -5616,6 +5620,23 @@ where
                             group_color,
                         )),
                     )
+                }
+
+                // Add blur backdrop for windows that request KDE blur
+                if mapped.has_blur() {
+                    let radius = mapped.corner_radius(geo.size.as_logical(), 8);
+                    let corner_radius = radius[0] as f32;
+                    elements.insert(
+                        0,
+                        CosmicMappedRenderElement::Overlay(BackdropShader::element(
+                            renderer,
+                            Key::Window(Usage::Overlay, mapped.key()),
+                            geo,
+                            corner_radius,
+                            alpha * BLUR_FALLBACK_ALPHA,
+                            BLUR_FALLBACK_COLOR,
+                        )),
+                    );
                 }
 
                 let (behavior, align) = if is_overview {

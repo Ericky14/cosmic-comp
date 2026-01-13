@@ -2,13 +2,16 @@
 
 use crate::{
     backend::render::{
-        CLEAR_COLOR, CursorMode, GlMultiError, GlMultiRenderer, PostprocessOutputConfig,
-        PostprocessShader, PostprocessState,
+        BLUR_ITERATIONS, BlurCaptureContext, BlurRenderState, BlurredTextureInfo, CLEAR_COLOR,
+        CursorMode, ElementFilter, GlMultiError, GlMultiRenderer, PostprocessOutputConfig,
+        PostprocessShader, PostprocessState, apply_blur_passes, blur_downsample_enabled,
+        cache_blur_texture_for_window, compute_element_content_hash, downsample_texture,
         element::{CosmicElement, DamageElement},
-        init_shaders, output_elements,
+        get_blur_group_content_hash, get_cached_blur_texture_for_window, init_shaders,
+        output_elements, store_blur_group_content_hash, workspace_elements,
     },
     config::ScreenFilter,
-    shell::Shell,
+    shell::{Shell, grabs::SeatMoveGrabState},
     state::SurfaceDmabufFeedback,
     utils::prelude::*,
     wayland::{
@@ -46,7 +49,7 @@ use smithay::{
         renderer::{
             Bind, Blit, BufferType, Frame, ImportDma, Offscreen, Renderer, RendererSuper, Texture,
             TextureFilter, buffer_dimensions, buffer_type,
-            damage::Error as RenderError,
+            damage::{Error as RenderError, OutputDamageTracker},
             element::{
                 Element, Kind, RenderElementStates,
                 texture::TextureRenderElement,
@@ -79,7 +82,7 @@ use smithay::{
         },
         wayland_server::protocol::wl_surface::WlSurface,
     },
-    utils::{Clock, Monotonic, Physical, Point, Rectangle, Transform},
+    utils::{Clock, Monotonic, Physical, Point, Rectangle, Scale, Transform},
     wayland::{
         dmabuf::{DmabufFeedbackBuilder, get_dmabuf},
         presentation::Refresh,
@@ -149,6 +152,7 @@ pub struct SurfaceThreadState {
     mirroring: Option<Output>,
     screen_filter: ScreenFilter,
     postprocess_textures: HashMap<DrmNode, PostprocessState>,
+    blur_state: BlurRenderState,
 
     shell: Arc<parking_lot::RwLock<Shell>>,
 
@@ -545,6 +549,7 @@ fn surface_thread(
         mirroring: None,
         screen_filter,
         postprocess_textures: HashMap::new(),
+        blur_state: BlurRenderState::default(),
 
         shell,
         loop_handle: event_loop.handle(),
@@ -662,6 +667,309 @@ fn surface_thread(
         .context("Failed to listen for events")?;
 
     event_loop.run(None, &mut state, |_| {}).map_err(Into::into)
+}
+
+/// Process blur for all windows that request it.
+///
+/// This captures background content for each blur window group, applies
+/// Kawase blur passes, and caches the result for compositing.
+#[profiling::function]
+fn process_blur(
+    renderer: &mut GlMultiRenderer,
+    blur_state: &mut BlurRenderState,
+    shell: &Arc<parking_lot::RwLock<Shell>>,
+    clock: &Clock<Monotonic>,
+    output_ref: &Output,
+    render_node: &DrmNode,
+    format: Fourcc,
+) {
+    use crate::shell::layout::floating::BlurWindowGroup;
+
+    let output_name = output_ref.name();
+
+    let has_blur = {
+        let shell_ref = shell.read();
+        shell_ref
+            .workspaces
+            .active(output_ref)
+            .is_some_and(|(_, workspace)| workspace.has_blur_windows())
+    };
+
+    if !has_blur {
+        return;
+    }
+
+    let blur_groups: Vec<BlurWindowGroup> = {
+        let shell_ref = shell.read();
+        if let Some((_, workspace_ref)) = shell_ref.workspaces.active(output_ref) {
+            workspace_ref.blur_windows_grouped(1.0)
+        } else {
+            Vec::new()
+        }
+    };
+
+    if blur_groups.is_empty() {
+        return;
+    }
+
+    let blur_start = std::time::Instant::now();
+    // Mode size is already in physical pixels - use it directly for blur textures
+    let output_size = output_ref
+        .current_mode()
+        .map(|m| m.size)
+        .unwrap_or_default();
+    let scale = Scale::from(output_ref.current_scale().fractional_scale());
+
+    // Ensure blur textures are allocated
+    if let Err(err) = blur_state.ensure_textures(renderer, format, output_size, scale) {
+        tracing::warn!(?err, "Failed to allocate blur textures");
+        return;
+    }
+
+    let total_windows: usize = blur_groups.iter().map(|g| g.windows.len()).sum();
+    let _blur_span = tracing::info_span!(
+        "kms_blur_processing",
+        output = %output_name,
+        blur_groups = blur_groups.len(),
+        blur_windows = total_windows,
+        output_w = output_size.w,
+        output_h = output_size.h,
+    )
+    .entered();
+
+    // Get grabbed window key to exclude from blur capture
+    let grabbed_window_key = {
+        let shell_ref = shell.read();
+        let last_active_seat = shell_ref.seats.last_active();
+        last_active_seat
+            .user_data()
+            .get::<SeatMoveGrabState>()
+            .and_then(|state| state.lock().ok())
+            .and_then(|guard| guard.as_ref().map(|s| s.element().key()))
+    };
+
+    let zoom_state = shell.read().zoom_state().cloned();
+
+    // Get workspace info
+    let workspace_info = {
+        let shell_ref = shell.read();
+        let (previous_idx, idx) = shell_ref.workspaces.active_num(output_ref);
+        shell_ref.workspaces.active(output_ref).map(|(prev, curr)| {
+            let previous = prev
+                .zip(previous_idx)
+                .map(|((w, start), idx)| (w.handle, idx, start));
+            let current = (curr.handle, idx);
+            (previous, current)
+        })
+    };
+
+    let Some((previous_workspace, workspace)) = workspace_info else {
+        return;
+    };
+
+    // Process each blur group
+    // OPTIMIZATION: Skip re-blurring if background hasn't changed
+    let mut any_blur_applied = false;
+    for (group_idx, group) in blur_groups.iter().enumerate() {
+        let _group_span = tracing::info_span!(
+            "blur_group",
+            group = group_idx,
+            windows = group.windows.len(),
+            z_threshold = group.capture_z_threshold,
+        )
+        .entered();
+
+        // Create blur capture context for this group
+        let blur_ctx =
+            BlurCaptureContext::new(group.capture_z_threshold, grabbed_window_key.clone());
+        let capture_filter = ElementFilter::BlurCapture(blur_ctx);
+
+        // Capture scene elements for the group (no cursor for blur capture)
+        let capture_elements: Result<Vec<CosmicElement<GlMultiRenderer>>, _> = {
+            let _capture_span = tracing::info_span!(
+                "blur_capture_elements",
+                z_threshold = group.capture_z_threshold,
+            )
+            .entered();
+
+            workspace_elements(
+                Some(render_node),
+                renderer,
+                shell,
+                zoom_state.as_ref(),
+                clock.now(),
+                output_ref,
+                previous_workspace,
+                workspace,
+                CursorMode::None,
+                &capture_filter,
+            )
+        };
+
+        let capture_elements = match capture_elements {
+            Ok(elems) => elems,
+            Err(err) => {
+                tracing::warn!(?err, "Failed to capture elements for blur");
+                continue;
+            }
+        };
+
+        // Compute content hash for cache invalidation
+        // This includes element IDs (which change on content updates) and geometry
+        let content_hash =
+            compute_element_content_hash(group.capture_z_threshold, &capture_elements, scale);
+
+        // Check if content has changed since last blur
+        let stored_hash = get_blur_group_content_hash(&output_name, group.capture_z_threshold);
+        let content_changed = stored_hash.is_none() || stored_hash != Some(content_hash);
+
+        // Also verify all windows have cached textures
+        let all_cached = group.windows.iter().all(|(window_key, _, _, _)| {
+            get_cached_blur_texture_for_window(&output_name, window_key).is_some()
+        });
+
+        let can_reuse_cache = !content_changed && all_cached;
+
+        if can_reuse_cache {
+            tracing::debug!(
+                group = group_idx,
+                windows = group.windows.len(),
+                "Skipping blur - cache valid (content unchanged)"
+            );
+            any_blur_applied = true;
+            continue;
+        }
+
+        tracing::debug!(
+            group = group_idx,
+            content_changed = content_changed,
+            all_cached = all_cached,
+            "Re-blurring group"
+        );
+
+        // Store the new content hash after we commit to re-blurring
+        store_blur_group_content_hash(&output_name, group.capture_z_threshold, content_hash);
+
+        // Render captured elements to background texture
+        let bg_render_ok = {
+            let _bg_render_span = tracing::info_span!(
+                "blur_bg_render",
+                elements = capture_elements.len(),
+                width = output_size.w,
+                height = output_size.h,
+            )
+            .entered();
+
+            if let Some(bg_texture) = blur_state.background_texture.as_mut() {
+                let mut blur_dt = OutputDamageTracker::new(output_size, scale, Transform::Normal);
+
+                let render_result = (|| {
+                    let mut gles_frame = bg_texture.render();
+                    gles_frame.draw::<_, RenderError<GlMultiError>>(|tex| {
+                        let bound = renderer.bind(tex).map_err(RenderError::Rendering)?;
+                        let mut bound_target = bound;
+                        let res = blur_dt.render_output(
+                            renderer,
+                            &mut bound_target,
+                            0, // Full redraw
+                            &capture_elements,
+                            CLEAR_COLOR,
+                        );
+                        match res {
+                            Ok(_) => Ok(Vec::new()),
+                            Err(e) => Err(e),
+                        }
+                    })
+                })();
+
+                render_result.is_ok()
+            } else {
+                false
+            }
+        };
+
+        // Downsample background to smaller texture for blur passes (if enabled)
+        let downsample_enabled = blur_downsample_enabled();
+        let downsample_ok = if downsample_enabled && bg_render_ok {
+            if let (Some(bg), Some(ds)) = (
+                blur_state.background_texture.as_ref().cloned(),
+                blur_state.downsampled_texture.as_mut(),
+            ) {
+                let blur_size = blur_state.texture_size;
+                downsample_texture(renderer, &bg, ds, output_size, blur_size).is_ok()
+            } else {
+                false
+            }
+        } else {
+            !downsample_enabled && bg_render_ok // Skip downsample step when disabled
+        };
+
+        // Apply blur passes (on downsampled or full-size textures)
+        if downsample_ok && blur_state.is_ready() {
+            let blur_size = blur_state.texture_size;
+            // Source texture: downsampled if enabled, background if disabled
+            let blur_source = if downsample_enabled {
+                blur_state.downsampled_texture.as_ref().cloned()
+            } else {
+                blur_state.background_texture.as_ref().cloned()
+            };
+
+            if let (Some(src), Some(ping), Some(pong)) = (
+                blur_source,
+                blur_state.texture_a.as_mut(),
+                blur_state.texture_b.as_mut(),
+            ) {
+                let blur_result = apply_blur_passes(
+                    renderer,
+                    &src,
+                    ping,
+                    pong,
+                    blur_size,
+                    scale,
+                    BLUR_ITERATIONS,
+                );
+
+                if blur_result.is_ok() {
+                    // Cache the same blurred texture for all windows in this group
+                    for (window_key, window_geo, _alpha, z_idx) in &group.windows {
+                        tracing::trace!(
+                            output = %output_name,
+                            global_z_idx = z_idx,
+                            window_geo = ?window_geo,
+                            blur_w = blur_size.w,
+                            blur_h = blur_size.h,
+                            downsampled = downsample_enabled,
+                            "KMS: Caching blur texture for window"
+                        );
+                        cache_blur_texture_for_window(
+                            &output_name,
+                            window_key,
+                            BlurredTextureInfo {
+                                texture: pong.clone(),
+                                size: blur_size,
+                                screen_size: output_size,
+                                scale,
+                                background_state_hash: content_hash,
+                            },
+                        );
+                    }
+                    any_blur_applied = true;
+                }
+            }
+        }
+    }
+
+    blur_state.blur_applied = any_blur_applied;
+
+    let blur_elapsed = blur_start.elapsed();
+    tracing::info!(
+        output = %output_name,
+        blur_groups = blur_groups.len(),
+        blur_applied = any_blur_applied,
+        elapsed_us = blur_elapsed.as_micros(),
+        elapsed_ms = ?blur_elapsed.as_millis(),
+        "KMS blur processing complete"
+    );
 }
 
 impl SurfaceThreadState {
@@ -1052,6 +1360,19 @@ impl SurfaceThreadState {
         if self.vrr_mode == AdaptiveSync::Enabled {
             vrr = has_active_fullscreen;
         }
+
+        // Process blur for windows that request it
+        let output_ref = self.mirroring.as_ref().unwrap_or(&self.output);
+        let blur_format = compositor.format();
+        process_blur(
+            &mut renderer,
+            &mut self.blur_state,
+            &self.shell,
+            &self.clock,
+            output_ref,
+            &render_node,
+            blur_format,
+        );
 
         let mut elements = output_elements(
             Some(&render_node),

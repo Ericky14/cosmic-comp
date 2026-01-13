@@ -16,6 +16,7 @@ use crate::{
         handlers::{data_device::get_dnd_icon, screencopy::SessionHolder},
         protocols::{
             a11y::A11yState,
+            blur::BlurState,
             corner_radius::CornerRadiusState,
             drm::WlDrmState,
             image_capture_source::ImageCaptureSourceState,
@@ -247,6 +248,7 @@ pub struct Common {
     pub theme: cosmic::Theme,
 
     // wayland state
+    pub blur_state: BlurState,
     pub compositor_state: CompositorState,
     pub corner_radius_state: CornerRadiusState,
     pub data_device_state: DataDeviceState,
@@ -631,6 +633,7 @@ impl State {
         let local_offset = UtcOffset::current_local_offset().expect("No yet multithreaded");
         let clock = Clock::new();
         let config = Config::load(&handle);
+        let blur_state = BlurState::new::<Self>(dh);
         let compositor_state = CompositorState::new::<Self>(dh);
         let corner_radius_state = CornerRadiusState::new::<Self>(dh);
         let data_device_state = DataDeviceState::new::<Self>(dh);
@@ -746,6 +749,7 @@ impl State {
                 kiosk_child: None,
                 theme: cosmic::theme::system_preference(),
 
+                blur_state,
                 compositor_state,
                 corner_radius_state,
                 data_device_state,

@@ -130,6 +130,13 @@ impl CosmicSurface {
         }
     }
 
+    /// Check if this surface has KDE blur effect enabled
+    pub fn has_blur(&self) -> bool {
+        self.wl_surface()
+            .map(|surface| crate::wayland::protocols::blur::has_blur(&surface))
+            .unwrap_or(false)
+    }
+
     pub fn corner_radius(&self, geometry_size: Size<i32, Logical>) -> Option<[u8; 4]> {
         self.wl_surface().and_then(|surface| {
             with_states(&surface, |states| {

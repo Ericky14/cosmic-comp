@@ -34,7 +34,7 @@ use smithay::{
 use std::{borrow::BorrowMut, cell::RefCell, time::Duration};
 use tracing::{error, info, warn};
 
-use super::render::{CursorMode, ScreenFilterStorage, init_shaders};
+use super::render::{BlurRenderState, CursorMode, ScreenFilterStorage, init_shaders};
 
 #[derive(Debug)]
 pub struct WinitState {
@@ -43,6 +43,7 @@ pub struct WinitState {
     output: Output,
     damage_tracker: OutputDamageTracker,
     screen_filter_state: ScreenFilterStorage,
+    blur_state: BlurRenderState,
 }
 
 impl WinitState {
@@ -65,6 +66,7 @@ impl WinitState {
             CursorMode::NotDefault,
             &mut self.screen_filter_state,
             &state.event_loop_handle,
+            &mut self.blur_state,
         ) {
             Ok(RenderOutputResult { damage, states, .. }) => {
                 std::mem::drop(fb);
@@ -219,6 +221,7 @@ pub fn init_backend(
         output: output.clone(),
         damage_tracker: OutputDamageTracker::from_output(&output),
         screen_filter_state: ScreenFilterStorage::default(),
+        blur_state: BlurRenderState::default(),
     });
 
     state

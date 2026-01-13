@@ -58,7 +58,7 @@ pub fn render_input_order<R: Default + 'static>(
     output: &Output,
     previous: Option<(WorkspaceHandle, usize, WorkspaceDelta)>,
     current: (WorkspaceHandle, usize),
-    element_filter: ElementFilter,
+    element_filter: &ElementFilter,
     callback: impl FnMut(Stage) -> ControlFlow<Result<R, OutputNoMode>, ()>,
 ) -> Result<R, OutputNoMode> {
     match render_input_order_internal(shell, output, previous, current, element_filter, callback) {
@@ -72,7 +72,7 @@ fn render_input_order_internal<R: 'static>(
     output: &Output,
     previous: Option<(WorkspaceHandle, usize, WorkspaceDelta)>,
     current: (WorkspaceHandle, usize),
-    element_filter: ElementFilter,
+    element_filter: &ElementFilter,
     mut callback: impl FnMut(Stage) -> ControlFlow<Result<R, OutputNoMode>, ()>,
 ) -> ControlFlow<Result<R, OutputNoMode>, ()> {
     if shell
@@ -210,7 +210,7 @@ fn render_input_order_internal<R: 'static>(
         }
     }
 
-    if element_filter != ElementFilter::LayerShellOnly {
+    if *element_filter != ElementFilter::LayerShellOnly {
         // overlay redirect windows
         // they need to be over sticky windows, because they could be popups of sticky windows,
         // and we can't differenciate that.
@@ -236,7 +236,7 @@ fn render_input_order_internal<R: 'static>(
         }
     }
 
-    if element_filter != ElementFilter::LayerShellOnly {
+    if *element_filter != ElementFilter::LayerShellOnly {
         // previous workspace popups
         if let Some((previous_handle, _, offset)) = previous.as_ref() {
             let Some(workspace) = shell.workspaces.space_for_handle(previous_handle) else {
@@ -316,12 +316,12 @@ fn render_input_order_internal<R: 'static>(
         }
 
         // sticky windows
-        if element_filter != ElementFilter::LayerShellOnly {
+        if *element_filter != ElementFilter::LayerShellOnly {
             callback(Stage::Sticky(&set.sticky_layer))?;
         }
     }
 
-    if element_filter != ElementFilter::LayerShellOnly {
+    if *element_filter != ElementFilter::LayerShellOnly {
         // workspace windows
         callback(Stage::Workspace {
             workspace,
@@ -379,11 +379,11 @@ fn render_input_order_internal<R: 'static>(
     ControlFlow::Continue(())
 }
 
-fn layer_popups(
-    output: &Output,
+fn layer_popups<'a>(
+    output: &'a Output,
     layer: Layer,
-    element_filter: ElementFilter,
-) -> impl Iterator<Item = (LayerSurface, PopupKind, Point<i32, Global>)> + '_ {
+    element_filter: &'a ElementFilter,
+) -> impl Iterator<Item = (LayerSurface, PopupKind, Point<i32, Global>)> + 'a {
     layer_surfaces(output, layer, element_filter).flat_map(move |(surface, location)| {
         let location_clone = location;
         let surface_clone = surface.clone();
@@ -394,11 +394,11 @@ fn layer_popups(
     })
 }
 
-fn layer_surfaces(
-    output: &Output,
+fn layer_surfaces<'a>(
+    output: &'a Output,
     layer: Layer,
-    element_filter: ElementFilter,
-) -> impl Iterator<Item = (LayerSurface, Point<i32, Global>)> + '_ {
+    element_filter: &'a ElementFilter,
+) -> impl Iterator<Item = (LayerSurface, Point<i32, Global>)> + 'a {
     // we want to avoid deadlocks on the layer-map in callbacks, so we need to clone the layer surfaces
     let layers = {
         let layer_map = layer_map_for_output(output);
@@ -412,7 +412,7 @@ fn layer_surfaces(
     layers
         .into_iter()
         .filter(move |(s, _)| {
-            !(element_filter == ElementFilter::ExcludeWorkspaceOverview
+            !(*element_filter == ElementFilter::ExcludeWorkspaceOverview
                 && s.namespace() == WORKSPACE_OVERVIEW_NAMESPACE)
         })
         .map(|(surface, geometry)| (surface, geometry.loc.as_local().to_global(output)))

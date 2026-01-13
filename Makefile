@@ -82,3 +82,11 @@ rpm: all
 	mkdir -p dist
 	cp -v $(RPM_BUILD)/RPMS/*/*.rpm dist/
 	@echo "RPM copied to dist/"
+
+run-debug:
+	WAYLAND_DISPLAY=wayland-2 \
+	COSMIC_COMP_LOG=warn,cosmic_comp::shell::layout::floating=debug,cosmic_comp::backend::render=debug \
+	cargo run 2>&1 \
+	| sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g' \
+	| grep -v 'smithay::backend::renderer::gles' \
+	| tee test.log

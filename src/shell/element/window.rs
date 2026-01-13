@@ -676,6 +676,11 @@ impl CosmicWindow {
             }
         })
     }
+
+    /// Check if this window has KDE blur effect enabled
+    pub fn has_blur(&self) -> bool {
+        self.0.with_program(|p| p.window.has_blur())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

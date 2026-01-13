@@ -2054,7 +2054,7 @@ impl State {
             output,
             previous_workspace,
             workspace,
-            element_filter,
+            &element_filter,
             |stage| {
                 match stage {
                     Stage::ZoomUI => {}
@@ -2188,7 +2188,7 @@ impl State {
             output,
             previous_workspace,
             workspace,
-            element_filter,
+            &element_filter,
             |stage| {
                 match stage {
                     Stage::ZoomUI => {

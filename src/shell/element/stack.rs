@@ -984,6 +984,14 @@ impl CosmicStack {
             }
         })
     }
+
+    /// Check if the active surface in this stack has KDE blur enabled
+    pub fn has_blur(&self) -> bool {
+        self.0.with_program(|p| {
+            let active_window = &p.windows.lock().unwrap()[p.active.load(Ordering::SeqCst)];
+            active_window.has_blur()
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

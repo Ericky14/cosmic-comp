@@ -3,12 +3,15 @@ use crate::shell::layout::tiling::RestoreTilingState;
 use crate::wayland::handlers::xdg_activation::ActivationContext;
 use crate::{
     backend::render::{
-        BackdropShader,
+        BackdropShader, ElementFilter,
         element::{AsGlowRenderer, FromGlesError},
     },
     shell::{
         ANIMATION_DURATION, OverviewMode, SeatMoveGrabState,
-        layout::{floating::FloatingLayout, tiling::TilingLayout},
+        layout::{
+            floating::{BlurWindowGroup, FloatingLayout},
+            tiling::TilingLayout,
+        },
     },
     state::State,
     utils::{prelude::*, tween::EaseRectangle},
@@ -57,7 +60,7 @@ use wayland_backend::server::ClientId;
 use super::{
     CosmicMappedRenderElement, CosmicSurface, ResizeDirection, ResizeMode,
     element::{
-        CosmicMapped, MaximizedState, resize_indicator::ResizeIndicator,
+        CosmicMapped, CosmicMappedKey, MaximizedState, resize_indicator::ResizeIndicator,
         stack::CosmicStackRenderElement, swap_indicator::SwapIndicator,
         window::CosmicWindowRenderElement,
     },
@@ -446,6 +449,92 @@ impl Workspace {
         self.fullscreen.take_if(|w| !w.alive());
         self.floating_layer.refresh();
         self.tiling_layer.refresh();
+    }
+
+    /// Check if this workspace has any windows with blur enabled
+    pub fn has_blur_windows(&self) -> bool {
+        let floating_has_blur = self.floating_layer.has_blur_windows();
+        let tiling_has_blur = self.tiling_layer.mapped().any(|(m, _)| m.has_blur());
+        let result = floating_has_blur || tiling_has_blur;
+
+        if result {
+            tracing::debug!(
+                floating_has_blur = floating_has_blur,
+                tiling_has_blur = tiling_has_blur,
+                "Workspace has blur windows"
+            );
+        }
+
+        result
+    }
+
+    /// Get blur windows in Z-order (bottom to top) with their keys
+    /// Returns (window_key, geometry, alpha, global_z_index) tuples
+    /// global_z_index is the position among ALL windows (not just blur windows)
+    /// Tiled windows are below floating windows in Z-order
+    pub fn blur_windows_ordered(
+        &self,
+        alpha: f32,
+    ) -> Vec<(CosmicMappedKey, Rectangle<i32, Local>, f32, usize)> {
+        let mut result = Vec::new();
+        let tiled_count = self.tiling_layer.mapped().count();
+
+        // Tiled windows come first (below floating windows)
+        for (idx, (mapped, geo)) in self.tiling_layer.mapped().enumerate() {
+            if mapped.has_blur() {
+                result.push((mapped.key(), geo, alpha, idx));
+            }
+        }
+
+        // Floating windows on top - their z-index is offset by tiled window count
+        for (key, geo, elem_alpha, local_z) in self.floating_layer.blur_windows_ordered(alpha) {
+            result.push((key, geo, elem_alpha, tiled_count + local_z));
+        }
+
+        result
+    }
+
+    /// Get blur windows grouped by shared capture requirements.
+    /// Consecutive blur windows (no non-blur windows between them) share a capture.
+    /// This optimizes rendering by reducing the number of scene captures needed.
+    ///
+    /// For now, this only returns floating layer groups since tiling layer
+    /// windows are typically all below floating windows. This can be extended
+    /// to merge groups across layers if needed.
+    pub fn blur_windows_grouped(&self, alpha: f32) -> Vec<BlurWindowGroup> {
+        let tiled_count = self.tiling_layer.mapped().count();
+
+        // Get floating layer groups and offset their z-indices
+        let mut groups = self.floating_layer.blur_windows_grouped(alpha);
+
+        // Offset all z-indices by tiled window count
+        for group in &mut groups {
+            group.capture_z_threshold += tiled_count;
+            for (_, _, _, z_idx) in &mut group.windows {
+                *z_idx += tiled_count;
+            }
+        }
+
+        // If there are tiled blur windows, we'd need to handle them here
+        // For now, assume tiled windows don't have blur or are at the bottom
+        // and floating windows form their own groups
+
+        groups
+    }
+
+    /// Get blur window geometries from this workspace
+    /// Returns (geometry, alpha) tuples for all blur windows
+    pub fn blur_window_geometries(&self, alpha: f32) -> Vec<(Rectangle<i32, Local>, f32)> {
+        let mut geometries = self.floating_layer.blur_window_geometries(alpha);
+
+        // Add tiling layer blur windows
+        for (mapped, geo) in self.tiling_layer.mapped() {
+            if mapped.has_blur() {
+                geometries.push((geo, alpha));
+            }
+        }
+
+        geometries
     }
 
     fn has_activation_token(&self, xdg_activation_state: &XdgActivationState) -> bool {
@@ -1523,6 +1612,7 @@ impl Workspace {
         resize_indicator: Option<(ResizeMode, ResizeIndicator)>,
         indicator_thickness: u8,
         theme: &CosmicTheme,
+        element_filter: ElementFilter,
     ) -> Result<Vec<WorkspaceRenderElement<R>>, OutputNotMapped>
     where
         R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
@@ -1661,6 +1751,7 @@ impl Workspace {
                         indicator_thickness,
                         alpha,
                         theme,
+                        element_filter.clone(),
                     )
                     .into_iter()
                     .map(WorkspaceRenderElement::from),
