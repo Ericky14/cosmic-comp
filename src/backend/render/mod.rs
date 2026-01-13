@@ -128,14 +128,15 @@ pub const DEFAULT_BLUR_RADIUS: f32 = 50.0;
 pub const BLUR_ITERATIONS: u32 = 4;
 
 use once_cell::sync::Lazy;
-/// Global cache for blurred textures per output
+/// Global cache for blurred textures per window
 ///
 /// This cache allows the blur render path to store blurred textures
 /// that can be read by the floating layout renderer.
-/// Key is the output name (String), value is the blurred texture.
+/// Key is (output_name, window_key_hash), value is the blurred texture.
+/// Each blur window gets its own texture capturing everything behind it.
 use std::sync::RwLock;
 
-/// Blurred texture data for an output
+/// Blurred texture data for a window
 #[derive(Debug, Clone)]
 pub struct BlurredTextureInfo {
     /// The blurred texture buffer
@@ -146,8 +147,17 @@ pub struct BlurredTextureInfo {
     pub scale: Scale<f64>,
 }
 
-/// Global cache of blurred textures per output
-pub static BLUR_TEXTURE_CACHE: Lazy<RwLock<HashMap<String, BlurredTextureInfo>>> =
+/// Cache key combining output name and window key hash
+type BlurCacheKey = (String, u64);
+
+/// Global cache of blurred textures per window per output
+/// For iterative rendering: each blur window has its own cached texture
+/// capturing everything behind it (including other blurred windows below)
+pub static BLUR_TEXTURE_CACHE: Lazy<RwLock<HashMap<BlurCacheKey, BlurredTextureInfo>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Legacy: Global cache for single blur texture per output (fallback)
+pub static BLUR_TEXTURE_CACHE_LEGACY: Lazy<RwLock<HashMap<String, BlurredTextureInfo>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -167,6 +177,36 @@ pub fn set_skip_blur_backdrops(skip: bool) {
 }
 
 use crate::shell::element::CosmicMapped;
+
+thread_local! {
+    /// Z-index threshold for excluding windows during blur capture
+    /// Windows at or above this global z-index will be excluded
+    static EXCLUDE_Z_THRESHOLD: RefCell<Option<usize>> = const { RefCell::new(None) };
+}
+
+/// Set the z-index threshold for excluding windows during blur capture
+/// Windows at this index or higher (further up in the stack) will be excluded
+pub fn set_exclude_z_threshold(threshold: usize) {
+    EXCLUDE_Z_THRESHOLD.with(|t| {
+        *t.borrow_mut() = Some(threshold);
+    });
+}
+
+/// Clear the z-index exclusion threshold
+pub fn clear_exclude_z_threshold() {
+    EXCLUDE_Z_THRESHOLD.with(|t| {
+        *t.borrow_mut() = None;
+    });
+}
+
+/// Check if a window at the given z-index should be excluded
+pub fn is_z_index_excluded(z_idx: usize) -> bool {
+    EXCLUDE_Z_THRESHOLD.with(|t| {
+        t.borrow()
+            .map(|threshold| z_idx >= threshold)
+            .unwrap_or(false)
+    })
+}
 
 thread_local! {
     /// Window currently being grabbed/moved - should be excluded from blur capture
@@ -209,16 +249,58 @@ pub fn is_window_grabbed(window: &CosmicMapped) -> bool {
     })
 }
 
-/// Store a blurred texture for an output
-pub fn cache_blur_texture(output_name: &str, info: BlurredTextureInfo) {
+/// Compute a hash for a window key (for cache lookup)
+fn window_key_hash(key: &CosmicMappedKey) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Store a blurred texture for a specific window on an output
+/// This is used for iterative multi-pass blur where each blur window
+/// gets its own texture capturing everything behind it.
+pub fn cache_blur_texture_for_window(
+    output_name: &str,
+    window_key: &CosmicMappedKey,
+    info: BlurredTextureInfo,
+) {
+    let key = (output_name.to_string(), window_key_hash(window_key));
     if let Ok(mut cache) = BLUR_TEXTURE_CACHE.write() {
+        cache.insert(key, info);
+    }
+}
+
+/// Get the cached blurred texture for a specific window on an output
+pub fn get_cached_blur_texture_for_window(
+    output_name: &str,
+    window_key: &CosmicMappedKey,
+) -> Option<BlurredTextureInfo> {
+    let key = (output_name.to_string(), window_key_hash(window_key));
+    if let Ok(cache) = BLUR_TEXTURE_CACHE.read() {
+        cache.get(&key).cloned()
+    } else {
+        None
+    }
+}
+
+/// Clear all blur textures for an output (e.g., on window close)
+pub fn clear_blur_textures_for_output(output_name: &str) {
+    if let Ok(mut cache) = BLUR_TEXTURE_CACHE.write() {
+        cache.retain(|(out, _), _| out != output_name);
+    }
+}
+
+/// Store a blurred texture for an output (legacy single-pass fallback)
+pub fn cache_blur_texture(output_name: &str, info: BlurredTextureInfo) {
+    if let Ok(mut cache) = BLUR_TEXTURE_CACHE_LEGACY.write() {
         cache.insert(output_name.to_string(), info);
     }
 }
 
-/// Get the cached blurred texture for an output
+/// Get the cached blurred texture for an output (legacy single-pass fallback)
 pub fn get_cached_blur_texture(output_name: &str) -> Option<BlurredTextureInfo> {
-    if let Ok(cache) = BLUR_TEXTURE_CACHE.read() {
+    if let Ok(cache) = BLUR_TEXTURE_CACHE_LEGACY.read() {
         cache.get(output_name).cloned()
     } else {
         None
@@ -228,7 +310,7 @@ pub fn get_cached_blur_texture(output_name: &str) -> Option<BlurredTextureInfo> 
 /// Clear the blur texture cache for an output
 #[allow(dead_code)]
 pub fn clear_blur_texture(output_name: &str) {
-    if let Ok(mut cache) = BLUR_TEXTURE_CACHE.write() {
+    if let Ok(mut cache) = BLUR_TEXTURE_CACHE_LEGACY.write() {
         cache.remove(output_name);
     }
 }
@@ -1105,18 +1187,14 @@ impl BlurredBackdropShader {
         // Convert from Local to Logical, then to Physical
         // Note: The blur texture is always captured in Transform::Normal orientation,
         // so we don't need to apply output transform here.
-        let phys_geo: Rectangle<i32, Physical> = element_geo
-            .as_logical()
-            .to_physical_precise_round(scale);
+        let phys_geo: Rectangle<i32, Physical> =
+            element_geo.as_logical().to_physical_precise_round(scale);
 
         // If transform is not Normal, we need to transform the coordinates
         // Transform affects how coordinates map to the buffer
         let phys_geo = if transform != Transform::Normal {
             // Transform the location within the screen bounds
-            let transformed_loc = transform.transform_point_in(
-                phys_geo.loc,
-                &screen_size,
-            );
+            let transformed_loc = transform.transform_point_in(phys_geo.loc, &screen_size);
             let transformed_size = transform.transform_size(phys_geo.size);
             Rectangle::new(transformed_loc, transformed_size)
         } else {
@@ -1439,7 +1517,9 @@ where
                 .lock()
                 .unwrap()
                 .as_ref()
-                .map(|state| state.render::<CosmicMappedRenderElement<R>, R>(renderer, output, theme))
+                .map(|state| {
+                    state.render::<CosmicMappedRenderElement<R>, R>(renderer, output, theme)
+                })
             {
                 elements.extend(grab_elements.into_iter().map(|elem| {
                     CosmicElement::MoveGrab(RescaleRenderElement::from_element(
@@ -2308,15 +2388,17 @@ where
 
         result
     } else if has_blur && !blur_geometries.is_empty() {
-        // Single-pass blur without frame delay:
-        // 1. Collect elements EXCLUDING blur backdrops
-        // 2. Render to blur source texture
-        // 3. Apply blur and cache
-        // 4. Re-collect elements (now blur backdrops will find cached texture)
-        // 5. Render final scene with blur backdrops
+        // Iterative multi-pass blur (macOS-style):
+        // For each blur window (bottom to top in Z-order):
+        //   1. Capture scene up to (but excluding) that window
+        //   2. Apply blur and cache per-window texture
+        // Then render final scene where each blur window uses its cached texture
+
+        let output_name = output.name();
         tracing::debug!(
             blur_geometry_count = blur_geometries.len(),
-            "Entering single-pass blur path"
+            output = %output_name,
+            "Entering iterative multi-pass blur path"
         );
 
         let output_size = output
@@ -2333,8 +2415,22 @@ where
             .ensure_textures(renderer, format, output_size, scale)
             .map_err(RenderError::Rendering)?;
 
+        // Get blur windows in Z-order (bottom to top)
+        let blur_windows = {
+            let shell_ref = shell.read();
+            let (_, workspace_ref) = shell_ref
+                .workspaces
+                .active(output)
+                .ok_or(RenderError::OutputNoMode(OutputNoMode))?;
+            workspace_ref.blur_windows_ordered(1.0)
+        };
+
+        tracing::debug!(
+            blur_window_count = blur_windows.len(),
+            "Processing blur windows iteratively"
+        );
+
         // Get the currently grabbed window (if any) to exclude it from blur capture
-        // Grabbed windows should be rendered on top and not be part of the blur source
         {
             let shell_ref = shell.read();
             let last_active_seat = shell_ref.seats.last_active();
@@ -2352,99 +2448,132 @@ where
             set_grabbed_window(grabbed_window);
         }
 
-        // Step 1: Collect elements WITHOUT blur backdrops (for clean background capture)
-        // Set flag to skip blur backdrops during this collection
-        set_skip_blur_backdrops(true);
-        let bg_elements: Vec<CosmicElement<R>> = workspace_elements(
-            gpu,
-            renderer,
-            shell,
-            zoom_state.as_ref(),
-            now,
-            output,
-            previous_workspace,
-            workspace,
-            cursor_mode,
-            element_filter, // Use original filter
-        )?;
-        set_skip_blur_backdrops(false);
-        set_grabbed_window(None); // Clear grabbed window after capture
+        // Iterative blur: for each blur window, capture everything below it
+        let mut any_blur_applied = false;
+        for (_idx, (window_key, _geometry, _alpha, global_z_idx)) in blur_windows.iter().enumerate()
+        {
+            tracing::debug!(
+                global_z_idx = global_z_idx,
+                "Capturing blur for window (excluding all windows at z >= {})",
+                global_z_idx
+            );
 
-        // Step 2: Render background elements to texture for blur source
-        let bg_render_ok = if let Some(bg_texture) = blur_state.background_texture.as_mut() {
-            let mut blur_dt = OutputDamageTracker::new(output_size, scale, Transform::Normal);
+            // Set z-index threshold - all windows at this index or above will be excluded
+            // This includes the blur window itself AND any non-blur windows above it
+            set_exclude_z_threshold(*global_z_idx);
+            set_skip_blur_backdrops(true); // Also skip blur backdrops during capture
 
-            let render_result = (|| {
-                let mut gles_frame = bg_texture.render();
+            // Capture scene elements (excluding windows at or above this z-index)
+            let capture_elements: Vec<CosmicElement<R>> = workspace_elements(
+                gpu,
+                renderer,
+                shell,
+                zoom_state.as_ref(),
+                now,
+                output,
+                previous_workspace,
+                workspace,
+                cursor_mode,
+                element_filter,
+            )?;
 
-                let render_res = gles_frame.draw::<_, RenderError<R::Error>>(|tex| {
-                    let bound = renderer.bind(tex).map_err(RenderError::Rendering)?;
-                    let mut bound_target = bound;
-                    let res = blur_dt.render_output(
-                        renderer,
-                        &mut bound_target,
-                        0, // Full redraw
-                        &bg_elements,
-                        CLEAR_COLOR,
-                    );
+            clear_exclude_z_threshold();
+            set_skip_blur_backdrops(false);
 
-                    match res {
-                        Ok(_) => Ok(Vec::new()),
-                        Err(e) => Err(e.into()),
-                    }
-                });
+            // Render captured elements to background texture
+            let bg_render_ok = if let Some(bg_texture) = blur_state.background_texture.as_mut() {
+                let mut blur_dt = OutputDamageTracker::new(output_size, scale, Transform::Normal);
 
-                render_res.map_err(|_| ())
-            })();
+                let render_result = (|| {
+                    let mut gles_frame = bg_texture.render();
 
-            render_result.is_ok()
-        } else {
-            false
-        };
+                    let render_res = gles_frame.draw::<_, RenderError<R::Error>>(|tex| {
+                        let bound = renderer.bind(tex).map_err(RenderError::Rendering)?;
+                        let mut bound_target = bound;
+                        let res = blur_dt.render_output(
+                            renderer,
+                            &mut bound_target,
+                            0, // Full redraw
+                            &capture_elements,
+                            CLEAR_COLOR,
+                        );
 
-        // Step 3: Apply blur passes and cache result
-        let blur_applied = if bg_render_ok && blur_state.is_ready() {
-            if let (Some(bg), Some(ping), Some(pong)) = (
-                blur_state.background_texture.as_ref().cloned(),
-                blur_state.texture_a.as_mut(),
-                blur_state.texture_b.as_mut(),
-            ) {
-                let blur_result = apply_blur_passes(
-                    renderer,
-                    &bg,
-                    ping,
-                    pong,
-                    output_size,
-                    scale,
-                    BLUR_ITERATIONS,
-                );
-                blur_state.blur_applied = blur_result.is_ok();
+                        match res {
+                            Ok(_) => Ok(Vec::new()),
+                            Err(e) => Err(e.into()),
+                        }
+                    });
 
-                if blur_result.is_ok() {
-                    // Cache blurred texture - floating layout will find this
-                    let output_name = output.name();
-                    cache_blur_texture(
-                        &output_name,
-                        BlurredTextureInfo {
-                            texture: pong.clone(),
-                            size: output_size,
-                            scale,
-                        },
-                    );
-                    tracing::debug!(output = %output_name, "Cached blurred texture for same-frame use");
-                    true
-                } else {
-                    tracing::warn!("Blur passes failed");
-                    false
-                }
+                    render_res.map_err(|_| ())
+                })();
+
+                render_result.is_ok()
             } else {
                 false
-            }
-        } else {
-            false
-        };
+            };
 
-        // Step 4: Re-collect ALL elements (blur backdrops will now find cached texture)
+            // Apply blur passes and cache result for this specific window
+            if bg_render_ok && blur_state.is_ready() {
+                if let (Some(bg), Some(ping), Some(pong)) = (
+                    blur_state.background_texture.as_ref().cloned(),
+                    blur_state.texture_a.as_mut(),
+                    blur_state.texture_b.as_mut(),
+                ) {
+                    let blur_result = apply_blur_passes(
+                        renderer,
+                        &bg,
+                        ping,
+                        pong,
+                        output_size,
+                        scale,
+                        BLUR_ITERATIONS,
+                    );
+
+                    if blur_result.is_ok() {
+                        // Cache blurred texture for this specific window
+                        cache_blur_texture_for_window(
+                            &output_name,
+                            window_key,
+                            BlurredTextureInfo {
+                                texture: pong.clone(),
+                                size: output_size,
+                                scale,
+                            },
+                        );
+                        tracing::debug!(
+                            global_z_idx = global_z_idx,
+                            "Cached per-window blurred texture"
+                        );
+                        any_blur_applied = true;
+                    } else {
+                        tracing::warn!(
+                            global_z_idx = global_z_idx,
+                            "Blur passes failed for window"
+                        );
+                    }
+                }
+            }
+        }
+
+        set_grabbed_window(None); // Clear grabbed window after all captures
+        blur_state.blur_applied = any_blur_applied;
+
+        // Also cache a global fallback for windows that don't have per-window cache
+        // (This uses the last captured blur, which is the full background)
+        if any_blur_applied {
+            if let Some(pong) = blur_state.texture_b.as_ref() {
+                cache_blur_texture(
+                    &output_name,
+                    BlurredTextureInfo {
+                        texture: pong.clone(),
+                        size: output_size,
+                        scale,
+                    },
+                );
+            }
+        }
+
+        // Final render: collect ALL elements (blur backdrops will find their per-window cached textures)
         let final_elements: Vec<CosmicElement<R>> = workspace_elements(
             gpu,
             renderer,
@@ -2455,14 +2584,14 @@ where
             previous_workspace,
             workspace,
             cursor_mode,
-            element_filter, // Use original filter (typically All)
+            element_filter,
         )?;
 
-        // Step 5: Render final scene with blur backdrops to actual target
+        // Render final scene with blur backdrops to actual target
         let result = damage_tracker.render_output(
             renderer,
             target,
-            if blur_applied { 0 } else { age }, // Force full redraw if blur active
+            if any_blur_applied { 0 } else { age }, // Force full redraw if blur active
             &final_elements,
             CLEAR_COLOR,
         )?;

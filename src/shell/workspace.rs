@@ -56,7 +56,7 @@ use wayland_backend::server::ClientId;
 use super::{
     CosmicMappedRenderElement, CosmicSurface, ResizeDirection, ResizeMode,
     element::{
-        CosmicMapped, MaximizedState, resize_indicator::ResizeIndicator,
+        CosmicMapped, CosmicMappedKey, MaximizedState, resize_indicator::ResizeIndicator,
         stack::CosmicStackRenderElement, swap_indicator::SwapIndicator,
         window::CosmicWindowRenderElement,
     },
@@ -457,6 +457,29 @@ impl Workspace {
                 tiling_has_blur = tiling_has_blur,
                 "Workspace has blur windows"
             );
+        }
+        
+        result
+    }
+
+    /// Get blur windows in Z-order (bottom to top) with their keys
+    /// Returns (window_key, geometry, alpha, global_z_index) tuples
+    /// global_z_index is the position among ALL windows (not just blur windows)
+    /// Tiled windows are below floating windows in Z-order
+    pub fn blur_windows_ordered(&self, alpha: f32) -> Vec<(CosmicMappedKey, Rectangle<i32, Local>, f32, usize)> {
+        let mut result = Vec::new();
+        let tiled_count = self.tiling_layer.mapped().count();
+        
+        // Tiled windows come first (below floating windows)
+        for (idx, (mapped, geo)) in self.tiling_layer.mapped().enumerate() {
+            if mapped.has_blur() {
+                result.push((mapped.key(), geo, alpha, idx));
+            }
+        }
+        
+        // Floating windows on top - their z-index is offset by tiled window count
+        for (key, geo, elem_alpha, local_z) in self.floating_layer.blur_windows_ordered(alpha) {
+            result.push((key, geo, elem_alpha, tiled_count + local_z));
         }
         
         result
