@@ -170,6 +170,7 @@ impl Animation {
     ) -> Option<Rectangle<i32, Local>> {
         match self {
             Animation::ClientDrivenResize {
+                start,
                 previous_geometry,
                 target_geometry,
                 ..
@@ -180,9 +181,26 @@ impl Animation {
                 let prev_size = previous_geometry.size;
                 let target_size = target_geometry.size;
 
-                // If sizes are the same, avoid division by zero
+                // If sizes are the same, this is a position-only animation
+                // Use time-based easing for smooth position animation
                 if prev_size == target_size {
-                    return Some(*target_geometry);
+                    let now = Instant::now();
+                    let progress = now
+                        .duration_since(*start)
+                        .min(ANIMATION_DURATION)
+                        .as_secs_f64()
+                        / ANIMATION_DURATION.as_secs_f64();
+
+                    // Use same easing as size animations
+                    let eased_geo: Rectangle<i32, Local> = ease(
+                        EaseInOutCubic,
+                        EaseRectangle(*previous_geometry),
+                        EaseRectangle(*target_geometry),
+                        progress,
+                    )
+                    .unwrap();
+
+                    return Some(eased_geo);
                 }
 
                 // Calculate progress based on size (use width as proxy, could average)
@@ -2206,7 +2224,10 @@ impl FloatingLayout {
                 let corner_radius = if elem.is_maximized(false) {
                     [0.0f32; 4]
                 } else {
-                    let radius = elem.corner_radius(geometry.size.as_logical(), crate::shell::element::DEFAULT_WINDOW_CORNER_RADIUS);
+                    let radius = elem.corner_radius(
+                        geometry.size.as_logical(),
+                        crate::shell::element::DEFAULT_WINDOW_CORNER_RADIUS,
+                    );
                     // Convert corner radii to f32 for shader
                     // Reorder from [bottom_right, top_right, bottom_left, top_left]
                     // to shader expected order: [top_left, top_right, bottom_right, bottom_left]

@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="cosmic_surface_embed_v1">
+  <copyright><![CDATA[
+    SPDX-FileCopyrightText: 2026 Playtron
+    SPDX-License-Identifier: GPL-3.0-only
+  ]]></copyright>
+
+  <description summary="embed foreign toplevel surfaces">
+    This protocol allows a client to embed foreign toplevel windows within
+    their own surface. The embedded surface will be rendered at a specified
+    position within the parent surface, and input events will be routed
+    to the embedded surface when the pointer is within the embed region.
+
+    This enables applications like chat assistants to display interactive
+    embedded views of other applications (calendars, web browsers, PDF viewers)
+    alongside their own UI.
+  </description>
+
+  <interface name="zcosmic_surface_embed_manager_v1" version="1">
+    <description summary="manager for surface embedding">
+      This interface is the entry point for creating embedded surface views.
+      A client can use this to embed foreign toplevel windows within their
+      own surface hierarchy.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager">
+        Destroy the manager object. This does not affect any existing
+        embedded surface objects.
+      </description>
+    </request>
+
+    <request name="embed_toplevel">
+      <description summary="embed a foreign toplevel into a surface">
+        Create an embedded surface view for a foreign toplevel window.
+        The toplevel will be rendered within the specified parent surface
+        at the geometry set via the embedded surface interface.
+
+        The parent surface must belong to the requesting client.
+        The toplevel_id is the identifier from the toplevel-info protocol
+        that identifies which toplevel to embed.
+      </description>
+      <arg name="id" type="new_id" interface="zcosmic_embedded_surface_v1"/>
+      <arg name="parent" type="object" interface="wl_surface"
+           summary="the surface to embed into"/>
+      <arg name="toplevel_id" type="string"
+           summary="the identifier of the toplevel to embed"/>
+    </request>
+  </interface>
+
+  <interface name="zcosmic_embedded_surface_v1" version="1">
+    <description summary="an embedded foreign surface">
+      This interface represents an embedded view of a foreign toplevel
+      within a parent surface. The client can configure the position,
+      size, and interactivity of the embedded view.
+
+      Input events (pointer, keyboard, touch) within the embed region
+      will be automatically routed to the embedded toplevel when
+      interactive mode is enabled.
+    </description>
+
+    <enum name="error">
+      <entry name="invalid_geometry" value="0"
+             summary="geometry values are invalid"/>
+      <entry name="toplevel_destroyed" value="1"
+             summary="the embedded toplevel was destroyed"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the embedded surface">
+        Destroy the embedded surface object. The embedded toplevel will
+        no longer be rendered within the parent surface, and input
+        routing will stop.
+      </description>
+    </request>
+
+    <request name="set_geometry">
+      <description summary="set the embed region geometry">
+        Set the position and size of the embedded surface within the
+        parent surface. The embedded toplevel will be scaled to fit
+        this region.
+
+        The geometry is in surface-local coordinates of the parent.
+        Width and height must be positive.
+      </description>
+      <arg name="x" type="int" summary="x position in parent surface"/>
+      <arg name="y" type="int" summary="y position in parent surface"/>
+      <arg name="width" type="int" summary="width of embed region"/>
+      <arg name="height" type="int" summary="height of embed region"/>
+    </request>
+
+    <request name="set_interactive">
+      <description summary="enable or disable input routing">
+        When interactive is non-zero, pointer, keyboard, and touch events
+        within the embed region will be routed to the embedded toplevel.
+        The embedded window will receive focus when clicked.
+
+        When interactive is zero, the embedded surface is display-only
+        and all input goes to the parent surface.
+
+        Default is non-interactive (0).
+      </description>
+      <arg name="interactive" type="uint"
+           summary="non-zero to enable input routing"/>
+    </request>
+
+    <request name="set_render_mode">
+      <description summary="set how the embedded surface is rendered">
+        Configure the rendering mode for the embedded surface.
+        
+        Mode 0 (live): The embedded surface is rendered live with
+        real-time updates. This uses compositor-side rendering.
+        
+        Mode 1 (screencopy): The embedded surface is captured via
+        screencopy and sent to the client as frames. This allows
+        the client to apply effects or transformations.
+        
+        Default is live (0).
+      </description>
+      <arg name="mode" type="uint" summary="0 for live, 1 for screencopy"/>
+    </request>
+
+    <request name="commit">
+      <description summary="apply pending changes">
+        Apply all pending geometry and mode changes. Changes are
+        double-buffered and only take effect after commit.
+      </description>
+    </request>
+
+    <event name="configure">
+      <description summary="embedded toplevel configuration changed">
+        Sent when the embedded toplevel's preferred size changes.
+        The client may want to adjust the embed geometry to match.
+      </description>
+      <arg name="width" type="int" summary="preferred width"/>
+      <arg name="height" type="int" summary="preferred height"/>
+    </event>
+
+    <event name="frame">
+      <description summary="new frame available (screencopy mode)">
+        In screencopy mode, sent when a new frame has been captured
+        and is ready to be displayed. The client should request the
+        frame data via the screencopy interface.
+        
+        In live mode, this event is not sent.
+      </description>
+    </event>
+
+    <event name="closed">
+      <description summary="embedded toplevel was closed">
+        The embedded toplevel was closed by the user or application.
+        The embedded surface object becomes inert after this event.
+        The client should destroy this object.
+      </description>
+    </event>
+
+    <event name="entered">
+      <description summary="pointer entered embed region">
+        Sent when the pointer enters the embed region and input
+        routing to the embedded toplevel begins.
+      </description>
+    </event>
+
+    <event name="left">
+      <description summary="pointer left embed region">
+        Sent when the pointer leaves the embed region and input
+        routing to the embedded toplevel stops.
+      </description>
+    </event>
+  </interface>
+</protocol>

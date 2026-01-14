@@ -2,6 +2,7 @@
 
 pub mod a11y;
 pub mod alpha_modifier;
+pub mod animated_resize;
 pub mod blur;
 pub mod buffer;
 pub mod compositor;
@@ -37,6 +38,7 @@ pub mod selection;
 pub mod session_lock;
 pub mod shm;
 pub mod single_pixel_buffer;
+pub mod surface_embed;
 pub mod tablet_manager;
 pub mod text_input;
 pub mod toplevel_info;

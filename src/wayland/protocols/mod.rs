@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 pub mod a11y;
+pub mod animated_resize;
 pub mod blur;
 pub mod corner_radius;
 pub mod drm;
@@ -9,6 +10,7 @@ pub mod output_configuration;
 pub mod output_power;
 pub mod overlap_notify;
 pub mod screencopy;
+pub mod surface_embed;
 pub mod toplevel_info;
 pub mod toplevel_management;
 pub mod workspace;

@@ -16,6 +16,7 @@ use crate::{
         handlers::{data_device::get_dnd_icon, screencopy::SessionHolder},
         protocols::{
             a11y::A11yState,
+            animated_resize::AnimatedResizeState,
             blur::BlurState,
             corner_radius::CornerRadiusState,
             drm::WlDrmState,
@@ -24,6 +25,7 @@ use crate::{
             output_power::OutputPowerState,
             overlap_notify::OverlapNotifyState,
             screencopy::ScreencopyState,
+            surface_embed::SurfaceEmbedManagerState,
             toplevel_info::ToplevelInfoState,
             toplevel_management::{ManagementCapabilities, ToplevelManagementState},
             workspace::{WorkspaceState, WorkspaceUpdateGuard},
@@ -248,6 +250,7 @@ pub struct Common {
     pub theme: cosmic::Theme,
 
     // wayland state
+    pub animated_resize_state: AnimatedResizeState,
     pub blur_state: BlurState,
     pub compositor_state: CompositorState,
     pub corner_radius_state: CornerRadiusState,
@@ -264,6 +267,7 @@ pub struct Common {
     pub wlr_data_control_state: WlrDataControlState,
     pub image_capture_source_state: ImageCaptureSourceState,
     pub screencopy_state: ScreencopyState,
+    pub surface_embed_state: SurfaceEmbedManagerState,
     pub seat_state: SeatState<State>,
     pub session_lock_manager_state: SessionLockManagerState,
     pub idle_notifier_state: IdleNotifierState<State>,
@@ -633,6 +637,7 @@ impl State {
         let local_offset = UtcOffset::current_local_offset().expect("No yet multithreaded");
         let clock = Clock::new();
         let config = Config::load(&handle);
+        let animated_resize_state = AnimatedResizeState::new::<Self>(dh);
         let blur_state = BlurState::new::<Self>(dh);
         let compositor_state = CompositorState::new::<Self>(dh);
         let corner_radius_state = CornerRadiusState::new::<Self>(dh);
@@ -651,6 +656,10 @@ impl State {
         let image_capture_source_state =
             ImageCaptureSourceState::new::<Self, _>(dh, client_not_sandboxed);
         let screencopy_state = ScreencopyState::new::<Self, _>(dh, client_not_sandboxed);
+        let surface_embed_state = SurfaceEmbedManagerState::new_with_filter::<Self, CosmicSurface, _>(
+            dh,
+            client_not_sandboxed,
+        );
         let shm_state =
             ShmState::new::<Self>(dh, vec![wl_shm::Format::Xbgr8888, wl_shm::Format::Abgr8888]);
         let cursor_shape_manager_state = CursorShapeManagerState::new::<State>(dh);
@@ -749,6 +758,7 @@ impl State {
                 kiosk_child: None,
                 theme: cosmic::theme::system_preference(),
 
+                animated_resize_state,
                 blur_state,
                 compositor_state,
                 corner_radius_state,
@@ -760,6 +770,7 @@ impl State {
                 idle_inhibiting_surfaces,
                 image_capture_source_state,
                 screencopy_state,
+                surface_embed_state,
                 shm_state,
                 cursor_shape_manager_state,
                 seat_state,

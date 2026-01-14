@@ -251,9 +251,9 @@ impl CosmicWindow {
         let width = window.geometry().size.w;
         let last_title = window.title();
 
-        if appearance.clip_floating_windows {
-            window.set_tiled(true);
-        }
+        // Note: We intentionally do NOT set_tiled based on clip_floating_windows.
+        // The tiled protocol state should only reflect actual tiling status,
+        // not visual clipping preferences. Clipping is handled compositor-side.
 
         CosmicWindow(IcedElement::new(
             CosmicWindowInternal {
@@ -627,14 +627,9 @@ impl CosmicWindow {
             let mut conf = p.appearance_conf.lock().unwrap();
             if &*conf != appearance {
                 *conf = *appearance;
-                if appearance.clip_floating_windows {
-                    p.window.set_tiled(true);
-                } else {
-                    if !p.tiled.load(Ordering::Acquire) {
-                        p.window.set_tiled(false);
-                    }
-                }
-                p.window.send_configure();
+                // Note: We do NOT modify tiled state based on clip_floating_windows.
+                // The tiled protocol state should only reflect actual tiling status.
+                // Clipping is handled compositor-side using the appearance config.
             }
         })
     }
@@ -669,9 +664,8 @@ impl CosmicWindow {
     pub fn set_tiled(&self, tiled: bool) {
         self.0.with_program(|p| {
             p.tiled.store(tiled, Ordering::Release);
-            if !p.appearance_conf.lock().unwrap().clip_floating_windows {
-                p.window.set_tiled(tiled);
-            }
+            // Always send actual tiled state to the client via protocol
+            p.window.set_tiled(tiled);
         });
     }
 

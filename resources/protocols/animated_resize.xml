@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="cosmic_animated_resize_v1">
+  <copyright>
+    Copyright © 2026 Playtron
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice (including the next
+    paragraph) shall be included in all copies or substantial portions of the
+    Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+  </copyright>
+
+  <description summary="animated window resize protocol">
+    This protocol allows clients to request that the compositor animate
+    a resize transition to a target size. The compositor will send
+    intermediate configure events to the client for smooth animation.
+    
+    This is useful for side panels, embedded viewers, and other UI
+    elements that need smooth resize transitions.
+  </description>
+
+  <interface name="zcosmic_animated_resize_manager_v1" version="1">
+    <description summary="manager for animated resize requests">
+      This interface allows clients to create animated resize controllers
+      for their toplevel surfaces.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager">
+        Destroy this manager object.
+      </description>
+    </request>
+
+    <request name="get_animated_resize">
+      <description summary="get animated resize controller for a surface">
+        Create an animated resize controller for the given wl_surface.
+        The surface must be the root surface of an xdg_toplevel.
+      </description>
+      <arg name="id" type="new_id" interface="zcosmic_animated_resize_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+  </interface>
+
+  <interface name="zcosmic_animated_resize_v1" version="1">
+    <description summary="animated resize controller">
+      This interface allows clients to request animated resize transitions.
+      The compositor will animate the window from its current size to the
+      target size by sending intermediate configure events.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy this controller">
+        Destroy this animated resize controller.
+      </description>
+    </request>
+
+    <request name="resize_to">
+      <description summary="request animated resize to target size">
+        Request the compositor to animate a resize from the current window
+        size to the specified target size. The compositor will send
+        intermediate xdg_toplevel.configure events with sizes along the
+        animation path.
+        
+        The client should render at each intermediate size for smooth
+        animation. When the animation completes, a 'done' event is sent.
+        
+        If width or height is 0, that dimension will not be changed.
+      </description>
+      <arg name="width" type="int" summary="target width in logical pixels"/>
+      <arg name="height" type="int" summary="target height in logical pixels"/>
+      <arg name="duration_ms" type="uint" summary="animation duration in milliseconds"/>
+    </request>
+
+    <request name="resize_to_with_position">
+      <description summary="request animated resize with target position">
+        Request the compositor to animate a resize from the current window
+        geometry to the specified target size and position. The compositor
+        will animate both size and position smoothly.
+        
+        The client should render at each intermediate size for smooth
+        animation. When the animation completes, a 'done' event is sent.
+        
+        If width or height is 0, that dimension will not be changed.
+        The x and y coordinates specify the target window position in
+        output-local coordinates.
+        
+        If the window is maximized/fullscreen, the position will be stored
+        and used when the window is restored to normal state.
+      </description>
+      <arg name="x" type="int" summary="target x position in logical pixels"/>
+      <arg name="y" type="int" summary="target y position in logical pixels"/>
+      <arg name="width" type="int" summary="target width in logical pixels"/>
+      <arg name="height" type="int" summary="target height in logical pixels"/>
+      <arg name="duration_ms" type="uint" summary="animation duration in milliseconds"/>
+    </request>
+
+    <event name="done">
+      <description summary="resize animation completed">
+        Sent when the animated resize has completed and the window has
+        reached its target size.
+      </description>
+    </event>
+
+    <event name="cancelled">
+      <description summary="resize animation was cancelled">
+        Sent if the animation was cancelled (e.g., user manually resized
+        the window during animation, or another resize_to was requested).
+      </description>
+    </event>
+  </interface>
+</protocol>
