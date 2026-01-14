@@ -2,10 +2,10 @@
 // Based on "An investigation of fast real-time GPU-based image blur algorithms" 
 // by Marius Bjørge (ARM Mali)
 //
-// Kawase blur provides high quality blur with fewer texture samples than
-// traditional Gaussian blur, especially for large blur radii like 50px.
-// Each pass samples 5 points in a diamond pattern, and multiple iterations
-// stack to create a smooth Gaussian-like result.
+// Tuned to replicate Figma blur 100:
+// - Figma blur 100 ≈ Gaussian σ ≈ 25–30px, effective diameter ~100–120px
+// - Heavy downsampling (1/8) + many iterations (24) + wide offset
+// - Softened center weight for more Gaussian-like energy distribution
 
 #version 100
 
@@ -32,32 +32,28 @@ uniform float tint;
 
 // Blur uniforms
 uniform vec2 tex_size;      // Size of the texture in pixels
-uniform float blur_radius;  // Blur radius - controls offset scale
+uniform float blur_radius;  // Blur radius - controls offset scale (100 for Figma blur 100)
 uniform float direction;    // 0.0 = horizontal-ish (down), 1.0 = vertical-ish (up)
 
 void main() {
     vec2 texel = 1.0 / tex_size;
     
     // Calculate offset based on blur radius
-    // To avoid tiling artifacts, use smaller offsets with more iterations.
-    // The blur spreads gradually across iterations rather than in large jumps.
-    // With 8 iterations, divisor of 16.0 gives smooth blur matching CSS blur(50px)
-    // Total spread ≈ blur_radius * 8 / 16 * iterations ≈ 50px effective spread
-    float offset = blur_radius / 16.0;
+    // At 1/8 resolution, small offsets spread widely in screen space.
+    // Use smaller offsets with many iterations to avoid banding/stripes.
+    // offset = 100 / 32 = 3.125 texels, but at 1/8 res = ~25px screen spread per pass
+    // With 24 iterations this accumulates to strong blur without visible stripes.
+    float offset = blur_radius / 32.0;
     
-    // Kawase blur samples in a diamond/cross pattern
-    // This achieves a box-blur-like effect that stacks into Gaussian
-    vec2 half_texel = texel * 0.5;
+    // Direction controls pass type:
+    // - direction 0: downsample passes (base offset)
+    // - direction 1: upsample passes (slightly larger offset)
+    float scale = direction < 0.5 ? offset : offset * 1.5;
     
-    // For direction 0 (downsample/horizontal-focused):
-    // Sample center + 4 corners offset by (offset, offset) pattern
-    // For direction 1 (upsample/vertical-focused):
-    // Sample center + 4 diagonal points at (offset*2, offset*2)
-    
-    float scale = direction < 0.5 ? offset : offset * 2.0;
-    
-    // Sample pattern: center + 4 diagonal samples (Kawase pattern)
-    vec4 sum = texture2D(tex, v_coords) * 4.0;
+    // Kawase blur with softened center weight for Figma-like result
+    // Reduced center weight (2.0 instead of 4.0) pushes more energy outward,
+    // creating a softer, more Gaussian-like blur matching Figma's look
+    vec4 sum = texture2D(tex, v_coords) * 2.0;
     
     // Sample at diagonal offsets - this creates the blur spread
     sum += texture2D(tex, v_coords + texel * vec2(-scale, -scale));
@@ -71,8 +67,8 @@ void main() {
     sum += texture2D(tex, v_coords + texel * vec2(0.0, -scale));
     sum += texture2D(tex, v_coords + texel * vec2(0.0,  scale));
     
-    // Average: center (4) + 4 diagonals (1 each) + 4 axis (1 each) = 12
-    vec4 result = sum / 12.0;
+    // Average: center (2) + 4 diagonals (1 each) + 4 axis (1 each) = 10
+    vec4 result = sum / 10.0;
     
     // Apply alpha
     result.a *= alpha;

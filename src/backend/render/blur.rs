@@ -51,33 +51,33 @@ use crate::shell::element::{CosmicMapped, CosmicMappedKey};
 // Constants
 // =============================================================================
 
-/// Default blur radius in pixels (design spec: blur(50px))
-/// CSS blur(50px) uses a Gaussian blur. Kawase blur approximates this
-/// with multiple iterations. A higher value creates more spread.
-pub const DEFAULT_BLUR_RADIUS: f32 = 50.0;
+/// Default blur radius in pixels (design spec: Figma blur 100)
+/// Figma blur 100 ≈ Gaussian σ ≈ 25–30px, effective diameter ~100–120px.
+/// This value is passed to the shader and scaled by the offset divisor.
+pub const DEFAULT_BLUR_RADIUS: f32 = 100.0;
 
-/// Number of blur iterations for stronger effect.
-/// More iterations with smaller offsets = smoother blur without tiling artifacts.
-/// 8 iterations provides smooth CSS blur(50px) equivalent.
-pub const BLUR_ITERATIONS: u32 = 8;
+/// Number of blur iterations for Figma-quality blur.
+/// Kawase blur needs many passes for large radii. For Figma blur 100:
+/// - Minimum: 16 passes
+/// - Good: 20-24 passes
+/// 24 iterations at 1/8 resolution is still very performant.
+pub const BLUR_ITERATIONS: u32 = 24;
 
-/// Downsample factor for blur textures (1/4 resolution = 1/2 each dimension).
-/// Blur removes high-frequency detail anyway, so downsampling is visually
-/// nearly identical but ~4x cheaper in memory and ~16x fewer pixels to process.
-/// Factor of 2 = 1/4 pixel count, Factor of 4 = 1/16 pixel count.
-/// Only used when `COSMIC_BLUR_DOWNSAMPLE=1`.
-pub const BLUR_DOWNSAMPLE_FACTOR: i32 = 2;
+/// Downsample factor for blur textures.
+/// For Figma blur 100, we need heavy downsampling:
+/// - Factor of 8 = 1/64 pixel count (1/8 in each dimension)
+/// This massively increases perceived blur and is very GPU-efficient.
+pub const BLUR_DOWNSAMPLE_FACTOR: i32 = 8;
 
 // =============================================================================
 // Environment Configuration
 // =============================================================================
 
 /// Check if blur texture downsampling is enabled via env var.
-/// When enabled, blur passes run at reduced resolution for better performance.
-/// When disabled, blur runs at full resolution (simpler but more GPU work).
-/// Set `COSMIC_BLUR_DOWNSAMPLE=1` to enable.
+/// Downsampling is enabled by default for strong CSS-like blur effect.
+/// Set `COSMIC_BLUR_DOWNSAMPLE=0` to disable (weaker blur, more GPU work).
 pub fn blur_downsample_enabled() -> bool {
-    crate::utils::env::bool_var("COSMIC_BLUR_DOWNSAMPLE").unwrap_or(false)
+    crate::utils::env::bool_var("COSMIC_BLUR_DOWNSAMPLE").unwrap_or(true)
 }
 
 // =============================================================================
