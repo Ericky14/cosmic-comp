@@ -194,7 +194,9 @@ impl CosmicWindowInternal {
         geometry_size: Size<i32, Logical>,
         default_radius: u8,
     ) -> [u8; 4] {
-        let has_ssd = self.has_ssd(false);
+        let is_embedded = is_surface_embedded(&self.window);
+        let has_ssd_raw = self.has_ssd(false);
+        let has_ssd = has_ssd_raw && !is_embedded;
         let is_tiled = self.is_tiled();
         let is_maximized = self.window.is_maximized(false);
         let appearance = self.appearance_conf.lock().unwrap();
@@ -209,7 +211,7 @@ impl CosmicWindowInternal {
             [0; 4]
         };
 
-        match (has_ssd, clip) {
+        let result = match (has_ssd, clip) {
             (has_ssd, true) => {
                 let mut corners = self.window.corner_radius(geometry_size).unwrap_or(radii);
 
@@ -237,7 +239,9 @@ impl CosmicWindowInternal {
                 .window
                 .corner_radius(geometry_size)
                 .unwrap_or([default_radius; 4]),
-        }
+        };
+
+        result
     }
 }
 
@@ -532,7 +536,7 @@ impl CosmicWindow {
         let clip = ((!is_tiled && appearance.clip_floating_windows)
             || (is_tiled && appearance.clip_tiled_windows))
             && !is_maximized;
-        if has_ssd && !clip {
+        if has_ssd && !clip && !is_embedded {
             // bottom corners
             radii[0] = 0;
             radii[2] = 0;
@@ -543,7 +547,7 @@ impl CosmicWindow {
             }
         }
 
-        let window_loc = if has_ssd {
+        let window_loc = if has_ssd && !is_embedded {
             location + Point::from((0, (SSD_HEIGHT as f64 * scale.y) as i32))
         } else {
             location
@@ -558,14 +562,14 @@ impl CosmicWindow {
             )
         });
         geo.loc += location.to_f64().to_logical(scale);
-        if has_ssd {
+        if has_ssd && !is_embedded {
             geo.size.h += SSD_HEIGHT as f64;
         }
         if let Some(max_size) = max_size {
             geo.size = geo.size.clamp(Size::default(), max_size.to_f64());
         }
 
-        if (has_ssd || clip) && !is_maximized && !is_embedded {
+        if ((has_ssd || clip) && !is_maximized) || is_embedded {
             let window_key =
                 CosmicMappedKey(CosmicMappedKeyInner::Window(Arc::downgrade(&self.0.0)));
 
@@ -598,7 +602,7 @@ impl CosmicWindow {
         }
 
         elements.extend(window_elements.into_iter().map(|elem| {
-            if has_ssd {
+            if has_ssd && !is_embedded {
                 radii[1] = 0;
                 radii[3] = 0;
             }
@@ -614,7 +618,7 @@ impl CosmicWindow {
             }
         }));
 
-        if has_ssd {
+        if has_ssd && !is_embedded {
             let ssd_loc = location
                 + self
                     .0

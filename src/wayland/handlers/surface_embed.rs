@@ -519,9 +519,6 @@ impl SurfaceEmbedHandler for State {
             parent.id()
         );
 
-        // Force client-side decorations for embedded windows (no title bar/borders)
-        toplevel.force_client_side_decorations();
-
         // Send initial configure with toplevel's preferred size
         let geometry = toplevel.geometry();
         embed.configure(geometry.size.w, geometry.size.h);
@@ -569,16 +566,13 @@ impl SurfaceEmbedHandler for State {
             anchor_config
         );
 
-        // Force client-side decorations for embedded windows (no title bar/borders)
-        toplevel.force_client_side_decorations();
-
         // Resize the toplevel to match the embed geometry size
         // This actually tells the toplevel (e.g., cosmic-term) to resize
         let global_geo = smithay::utils::Rectangle::new(
             (actual_geometry.loc.x, actual_geometry.loc.y).into(),
             (actual_geometry.size.w, actual_geometry.size.h).into(),
         );
-        toplevel.set_geometry(global_geo, 0); // No SSD height since we're forcing CSD
+        toplevel.set_geometry(global_geo, 0); // Pass 0 for SSD height - we skip SSD rendering for embedded
 
         // Send configure event to the parent client (chat-ui-rs)
         // This tells it the preferred size changed
