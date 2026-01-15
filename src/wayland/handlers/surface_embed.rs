@@ -159,7 +159,10 @@ pub fn is_parent_grabbed(parent_surface_id: &str) -> bool {
 pub fn mark_pid_pending_embed(pid: u32) {
     if let Ok(mut set) = PIDS_PENDING_EMBED.write() {
         set.insert(pid);
-        tracing::info!(pid = pid, "Marked PID as pending embed (will hide until embedded)");
+        tracing::info!(
+            pid = pid,
+            "Marked PID as pending embed (will hide until embedded)"
+        );
     }
 }
 
@@ -188,7 +191,10 @@ pub fn mark_surface_id_pending_embed(surface_id: &str) {
     }
     if let Ok(mut set) = SURFACE_IDS_PENDING_EMBED.write() {
         set.insert(surface_id.to_string());
-        tracing::info!(surface_id = surface_id, "Marked surface as pending embed (will hide until embedded)");
+        tracing::info!(
+            surface_id = surface_id,
+            "Marked surface as pending embed (will hide until embedded)"
+        );
     }
 }
 
@@ -196,7 +202,10 @@ pub fn mark_surface_id_pending_embed(surface_id: &str) {
 pub fn unmark_surface_id_pending_embed(surface_id: &str) {
     if let Ok(mut set) = SURFACE_IDS_PENDING_EMBED.write() {
         if set.remove(surface_id) {
-            tracing::info!(surface_id = surface_id, "Unmarked surface from pending embed (now visible)");
+            tracing::info!(
+                surface_id = surface_id,
+                "Unmarked surface from pending embed (now visible)"
+            );
         }
     }
 }
@@ -872,7 +881,7 @@ impl State {
             // IMMEDIATELY mark this specific surface as pending embed to hide it
             // This prevents any render frames showing the window before embed is fulfilled
             mark_surface_id_pending_embed(&surface_id);
-            
+
             // Unmark PID from pending (we found the window)
             unmark_pid_pending_embed(pid);
             let app_id = window.app_id();
