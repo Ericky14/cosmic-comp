@@ -29,7 +29,9 @@ use smithay::{
         },
     },
     output::Output,
+    reexports::wayland_server::Resource,
     utils::{IsAlive, Logical, Point, Rectangle, Serial, Size},
+    wayland::seat::WaylandFocus,
 };
 use tracing::debug;
 
@@ -67,8 +69,11 @@ pub struct ResizeSurfaceGrab {
 }
 
 impl ResizeSurfaceGrab {
-    // Returns `true` if grab should be unset
-    fn update_location(&mut self, location: Point<f64, Global>) -> bool {
+    // Returns `Some(updated_embeds)` if grab should continue, `None` if grab should be unset
+    fn update_location(
+        &mut self,
+        location: Point<f64, Global>,
+    ) -> Option<Vec<(String, Rectangle<i32, Logical>)>> {
         // It is impossible to get `min_size` and `max_size` of dead toplevel, so we return early.
         if !self.window.alive() {
             self.seat
@@ -77,7 +82,7 @@ impl ResizeSurfaceGrab {
                 .unwrap()
                 .0
                 .store(false, Ordering::SeqCst);
-            return true;
+            return None;
         }
 
         let (mut dx, mut dy) = (location - self.start_data.location().as_global()).into();
@@ -167,7 +172,21 @@ impl ResizeSurfaceGrab {
             self.window.configure();
         }
 
-        false
+        // Update any embedded windows immediately during resize for instant response
+        let parent_surface_id = self
+            .window
+            .active_window()
+            .wl_surface()
+            .map(|s| s.id().to_string());
+        let updated = parent_surface_id
+            .map(|sid| crate::wayland::handlers::surface_embed::update_embedded_geometry_for_parent_by_surface_id(
+                &sid,
+                new_window_width,
+                new_window_height,
+            ))
+            .unwrap_or_default();
+
+        Some(updated)
     }
 
     pub fn is_touch_grab(&self) -> bool {
@@ -189,8 +208,38 @@ impl PointerGrab<State> for ResizeSurfaceGrab {
         // While the grab is active, no client has pointer focus
         handle.motion(data, None, event);
 
-        if self.update_location(event.location.as_global()) {
-            handle.unset_grab(self, data, event.serial, event.time, true);
+        match self.update_location(event.location.as_global()) {
+            None => {
+                // Grab should be unset
+                handle.unset_grab(self, data, event.serial, event.time, true);
+            }
+            Some(updated_embeds) => {
+                // Configure any embedded windows that were updated
+                for (embedded_surface_id, new_geometry) in updated_embeds {
+                    // Find and configure embedded window in workspace by surface ID
+                    if let Some(ws) = data
+                        .common
+                        .shell
+                        .write()
+                        .workspaces
+                        .active_mut(&self.output)
+                    {
+                        if let Some(embedded_elem) = ws.floating_layer.space.elements().find(|e| {
+                            e.active_window()
+                                .wl_surface()
+                                .map(|s| s.id().to_string() == embedded_surface_id)
+                                .unwrap_or(false)
+                        }) {
+                            let global_geo = Rectangle::new(
+                                (new_geometry.loc.x, new_geometry.loc.y).into(),
+                                (new_geometry.size.w, new_geometry.size.h).into(),
+                            );
+                            embedded_elem.active_window().set_geometry(global_geo, 0);
+                            embedded_elem.configure();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -357,10 +406,41 @@ impl TouchGrab<State> for ResizeSurfaceGrab {
         event: &TouchMotionEvent,
         seq: Serial,
     ) {
-        if event.slot == <Self as TouchGrab<State>>::start_data(self).slot
-            && self.update_location(event.location.as_global())
-        {
-            handle.unset_grab(self, data);
+        if event.slot == <Self as TouchGrab<State>>::start_data(self).slot {
+            match self.update_location(event.location.as_global()) {
+                None => {
+                    // Grab should be unset
+                    handle.unset_grab(self, data);
+                }
+                Some(updated_embeds) => {
+                    // Configure any embedded windows that were updated
+                    for (embedded_surface_id, new_geometry) in updated_embeds {
+                        if let Some(ws) = data
+                            .common
+                            .shell
+                            .write()
+                            .workspaces
+                            .active_mut(&self.output)
+                        {
+                            if let Some(embedded_elem) =
+                                ws.floating_layer.space.elements().find(|e| {
+                                    e.active_window()
+                                        .wl_surface()
+                                        .map(|s| s.id().to_string() == embedded_surface_id)
+                                        .unwrap_or(false)
+                                })
+                            {
+                                let global_geo = Rectangle::new(
+                                    (new_geometry.loc.x, new_geometry.loc.y).into(),
+                                    (new_geometry.size.w, new_geometry.size.h).into(),
+                                );
+                                embedded_elem.active_window().set_geometry(global_geo, 0);
+                                embedded_elem.configure();
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         handle.motion(data, None, event, seq);

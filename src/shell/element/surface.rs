@@ -318,6 +318,35 @@ impl CosmicSurface {
         }
     }
 
+    /// Force client-side decorations (no server-side decorations)
+    /// Used for embedded windows that should not have window decorations
+    pub fn force_client_side_decorations(&self) {
+        match self.0.underlying_surface() {
+            WindowSurface::Wayland(toplevel) => {
+                // Store the previous mode so we can restore it later if needed
+                let previous_decoration_state = toplevel.with_committed_state(|state| {
+                    state.map_or_else(Default::default, |state| state.decoration_mode)
+                });
+                if PreferredDecorationMode::is_unset(&self.0) {
+                    PreferredDecorationMode::update(&self.0, previous_decoration_state);
+                }
+                // Set to ClientSide decorations
+                toplevel.with_pending_state(|pending| {
+                    pending.decoration_mode = Some(DecorationMode::ClientSide);
+                });
+                // Also notify KDE decoration protocol
+                with_states(toplevel.wl_surface(), |data| {
+                    if let Some(kde_data) = data.data_map.get::<KdeDecorationData>() {
+                        for obj in kde_data.lock().unwrap().objs.iter() {
+                            obj.mode(KdeMode::Client);
+                        }
+                    }
+                })
+            }
+            WindowSurface::X11(_surface) => {}
+        }
+    }
+
     pub fn is_resizing(&self, pending: bool) -> Option<bool> {
         match self.0.underlying_surface() {
             WindowSurface::Wayland(toplevel) => {

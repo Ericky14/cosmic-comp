@@ -880,6 +880,18 @@ impl State {
                     .current_focus()
                     .and_then(|f| f.active_window())
                 {
+                    // Check if the focused window is embedded - if so, minimize parent
+                    if let Some(parent_surface_id) =
+                        crate::wayland::handlers::surface_embed::get_parent_surface_id(
+                            &focused_window,
+                        )
+                    {
+                        if let Some(parent) = shell.element_for_surface_id(&parent_surface_id) {
+                            let parent_window = parent.active_window();
+                            shell.minimize_request(&parent_window);
+                            return;
+                        }
+                    }
                     shell.minimize_request(&focused_window);
                 }
             }
@@ -889,6 +901,23 @@ impl State {
                 if let Some(KeyboardFocusTarget::Element(window)) =
                     seat.get_keyboard().unwrap().current_focus()
                 {
+                    // Check if the focused window is embedded - if so, maximize parent
+                    for (surface, _) in window.windows() {
+                        if let Some(parent_surface_id) =
+                            crate::wayland::handlers::surface_embed::get_parent_surface_id(&surface)
+                        {
+                            if let Some(parent) =
+                                shell.element_for_surface_id(&parent_surface_id).cloned()
+                            {
+                                shell.maximize_toggle(
+                                    &parent,
+                                    seat,
+                                    &self.common.event_loop_handle,
+                                );
+                                return;
+                            }
+                        }
+                    }
                     shell.maximize_toggle(&window, seat, &self.common.event_loop_handle);
                 }
             }
@@ -900,6 +929,52 @@ impl State {
                 let mut shell = self.common.shell.write();
                 match seat.get_keyboard().unwrap().current_focus() {
                     Some(KeyboardFocusTarget::Element(window)) => {
+                        tracing::debug!("Fullscreen: focused on Element window");
+                        // Check if the focused window is embedded - if so, fullscreen parent
+                        for (surface, _) in window.windows() {
+                            tracing::debug!(
+                                "Fullscreen: checking surface app_id='{}'",
+                                surface.app_id()
+                            );
+                            if let Some(parent_surface_id) =
+                                crate::wayland::handlers::surface_embed::get_parent_surface_id(
+                                    &surface,
+                                )
+                            {
+                                tracing::debug!(
+                                    "Fullscreen: surface is embedded, parent_surface_id='{}'",
+                                    parent_surface_id
+                                );
+                                if let Some(parent_window) = shell
+                                    .element_for_surface_id(&parent_surface_id)
+                                    .map(|p| p.active_window())
+                                {
+                                    tracing::debug!(
+                                        "Fullscreen: found parent window, requesting fullscreen"
+                                    );
+                                    if let Some(target) = shell.fullscreen_request(
+                                        &parent_window,
+                                        focused_output.clone(),
+                                        &self.common.event_loop_handle,
+                                    ) {
+                                        std::mem::drop(shell);
+                                        Shell::set_focus(
+                                            self,
+                                            Some(&target),
+                                            seat,
+                                            Some(serial),
+                                            true,
+                                        );
+                                    }
+                                    return;
+                                } else {
+                                    tracing::warn!(
+                                        "Fullscreen: could not find parent element for surface_id='{}'",
+                                        parent_surface_id
+                                    );
+                                }
+                            }
+                        }
                         if let Some(target) = shell.fullscreen_request(
                             &window.active_window(),
                             focused_output,
@@ -910,6 +985,22 @@ impl State {
                         }
                     }
                     Some(KeyboardFocusTarget::Fullscreen(surface)) => {
+                        // Check if the fullscreen surface is embedded - if so, unfullscreen parent
+                        if let Some(parent_surface_id) =
+                            crate::wayland::handlers::surface_embed::get_parent_surface_id(&surface)
+                        {
+                            if let Some(parent) = shell.element_for_surface_id(&parent_surface_id) {
+                                let parent_surface = parent.active_window();
+                                if let Some(target) = shell.unfullscreen_request(
+                                    &parent_surface,
+                                    &self.common.event_loop_handle,
+                                ) {
+                                    std::mem::drop(shell);
+                                    Shell::set_focus(self, Some(&target), seat, Some(serial), true);
+                                }
+                                return;
+                            }
+                        }
                         if let Some(target) =
                             shell.unfullscreen_request(&surface, &self.common.event_loop_handle)
                         {

@@ -373,45 +373,57 @@ impl CompositorHandler for State {
 
 impl State {
     fn send_initial_configure_and_map(&mut self, surface: &WlSurface) -> bool {
-        let mut shell = self.common.shell.write();
-
-        if let Some(pending) = shell
-            .pending_windows
-            .iter()
-            .find(|pending| pending.surface.wl_surface().as_deref() == Some(surface))
+        // Check for pending windows first
         {
-            if let Some(toplevel) = pending.surface.0.toplevel() {
-                let initial_size = if let Some(output) = pending.fullscreen.as_ref() {
-                    Some(output.geometry().size.as_logical())
-                } else if pending.maximized {
-                    let active_output = shell.seats.last_active().active_output();
-                    let zone = layer_map_for_output(&active_output).non_exclusive_zone();
-                    Some(zone.size)
-                } else {
-                    None
-                };
-                if toplevel_ensure_initial_configure(toplevel, initial_size)
-                    && with_renderer_surface_state(surface, |state| state.buffer().is_some())
-                        .unwrap_or(false)
-                {
-                    let window = pending.surface.clone();
-                    window.on_commit();
-                    let res = shell.map_window(
-                        &window,
-                        &mut self.common.toplevel_info_state,
-                        &mut self.common.workspace_state,
-                        &self.common.event_loop_handle,
-                    );
-                    if let Some(target) = res {
-                        let seat = shell.seats.last_active().clone();
+            let mut shell = self.common.shell.write();
+
+            if let Some(pending) = shell
+                .pending_windows
+                .iter()
+                .find(|pending| pending.surface.wl_surface().as_deref() == Some(surface))
+            {
+                if let Some(toplevel) = pending.surface.0.toplevel() {
+                    let initial_size = if let Some(output) = pending.fullscreen.as_ref() {
+                        Some(output.geometry().size.as_logical())
+                    } else if pending.maximized {
+                        let active_output = shell.seats.last_active().active_output();
+                        let zone = layer_map_for_output(&active_output).non_exclusive_zone();
+                        Some(zone.size)
+                    } else {
+                        None
+                    };
+                    if toplevel_ensure_initial_configure(toplevel, initial_size)
+                        && with_renderer_surface_state(surface, |state| state.buffer().is_some())
+                            .unwrap_or(false)
+                    {
+                        let window = pending.surface.clone();
+                        window.on_commit();
+                        let res = shell.map_window(
+                            &window,
+                            &mut self.common.toplevel_info_state,
+                            &mut self.common.workspace_state,
+                            &self.common.event_loop_handle,
+                        );
+                        // Drop shell lock before checking pending embeds
                         std::mem::drop(shell);
-                        Shell::set_focus(self, Some(&target), &seat, None, true);
+
+                        // Check if this window matches any pending PID-based embed requests
+                        self.check_pending_pid_embeds_for_window(&window);
+
+                        if let Some(target) = res {
+                            let shell = self.common.shell.read();
+                            let seat = shell.seats.last_active().clone();
+                            std::mem::drop(shell);
+                            Shell::set_focus(self, Some(&target), &seat, None, true);
+                        }
                         return true;
                     }
                 }
             }
         }
 
+        // Check for pending layers
+        let mut shell = self.common.shell.write();
         if let Some(layer_surface) = shell
             .pending_layers
             .iter()

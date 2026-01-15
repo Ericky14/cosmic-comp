@@ -14,7 +14,10 @@ use crate::{
         layout::floating::TiledCorners,
     },
     utils::prelude::*,
-    wayland::protocols::toplevel_info::{toplevel_enter_output, toplevel_enter_workspace},
+    wayland::{
+        handlers::surface_embed::{EmbedRenderInfo, mark_parent_grabbed, unmark_parent_grabbed},
+        protocols::toplevel_info::{toplevel_enter_output, toplevel_enter_workspace},
+    },
 };
 
 use calloop::LoopHandle;
@@ -40,7 +43,9 @@ use smithay::{
         touch::{self, GrabStartData as TouchGrabStartData, TouchGrab, TouchInnerHandle},
     },
     output::Output,
+    reexports::wayland_server::Resource,
     utils::{IsAlive, Logical, Point, Rectangle, SERIAL_COUNTER, Scale, Serial},
+    wayland::seat::WaylandFocus,
 };
 use std::{
     collections::HashSet,
@@ -68,7 +73,13 @@ pub struct MoveGrabState {
 
 impl MoveGrabState {
     #[profiling::function]
-    pub fn render<I, R>(&self, renderer: &mut R, output: &Output, theme: &CosmicTheme) -> Vec<I>
+    pub fn render<I, R>(
+        &self,
+        renderer: &mut R,
+        output: &Output,
+        theme: &CosmicTheme,
+        embedded_children: &[(CosmicMapped, EmbedRenderInfo)],
+    ) -> Vec<I>
     where
         R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
         R::TextureId: Send + Clone + 'static,
@@ -217,49 +228,82 @@ impl MoveGrabState {
             alpha,
         );
 
-        self.stacking_indicator
+        // Render embedded children on top of the parent window
+        // They should follow the dragged parent position
+        let parent_geo_size = self.window.geometry().size;
+        let embedded_elements: Vec<CosmicMappedRenderElement<R>> = embedded_children
             .iter()
-            .flat_map(|(indicator, location)| {
-                indicator.render_elements(
+            .flat_map(|(embedded_elem, embed_info)| {
+                // Calculate actual geometry using anchor config or stored geometry
+                let actual_geometry = if let Some(ref anchor_config) = embed_info.anchor_config {
+                    anchor_config.calculate_geometry(parent_geo_size.w, parent_geo_size.h)
+                } else {
+                    embed_info.geometry
+                };
+
+                // Embedded window position = parent render location + embed offset
+                let embed_render_location = render_location + actual_geometry.loc;
+
+                embedded_elem.render_elements::<R, CosmicMappedRenderElement<R>>(
                     renderer,
-                    location.to_physical_precise_round(output_scale),
+                    (embed_render_location - embedded_elem.geometry().loc)
+                        .to_physical_precise_round(output_scale),
+                    None,
                     output_scale,
-                    1.0,
+                    alpha,
+                    None,
                 )
             })
-            .chain(p_elements)
-            .chain(focus_element)
+            .collect();
+
+        // Embedded windows at the front (top z-order), then rest of the elements
+        embedded_elements
+            .into_iter()
             .chain(
-                w_elements
-                    .into_iter()
-                    .chain(shadow_element)
-                    .map(|elem| match elem {
-                        CosmicMappedRenderElement::Stack(stack) => {
-                            CosmicMappedRenderElement::GrabbedStack(
-                                RescaleRenderElement::from_element(
-                                    stack,
-                                    render_location.to_physical_precise_round(
-                                        output.current_scale().fractional_scale(),
-                                    ),
-                                    scale,
-                                ),
-                            )
-                        }
-                        CosmicMappedRenderElement::Window(window) => {
-                            CosmicMappedRenderElement::GrabbedWindow(
-                                RescaleRenderElement::from_element(
-                                    window,
-                                    render_location.to_physical_precise_round(
-                                        output.current_scale().fractional_scale(),
-                                    ),
-                                    scale,
-                                ),
-                            )
-                        }
-                        x => x,
-                    }),
+                self.stacking_indicator
+                    .iter()
+                    .flat_map(|(indicator, location)| {
+                        indicator.render_elements(
+                            renderer,
+                            location.to_physical_precise_round(output_scale),
+                            output_scale,
+                            1.0,
+                        )
+                    })
+                    .chain(p_elements)
+                    .chain(focus_element)
+                    .chain(
+                        w_elements
+                            .into_iter()
+                            .chain(shadow_element)
+                            .map(|elem| match elem {
+                                CosmicMappedRenderElement::Stack(stack) => {
+                                    CosmicMappedRenderElement::GrabbedStack(
+                                        RescaleRenderElement::from_element(
+                                            stack,
+                                            render_location.to_physical_precise_round(
+                                                output.current_scale().fractional_scale(),
+                                            ),
+                                            scale,
+                                        ),
+                                    )
+                                }
+                                CosmicMappedRenderElement::Window(window) => {
+                                    CosmicMappedRenderElement::GrabbedWindow(
+                                        RescaleRenderElement::from_element(
+                                            window,
+                                            render_location.to_physical_precise_round(
+                                                output.current_scale().fractional_scale(),
+                                            ),
+                                            scale,
+                                        ),
+                                    )
+                                }
+                                x => x,
+                            }),
+                    )
+                    .chain(snapping_indicator),
             )
-            .chain(snapping_indicator)
             .map(I::from)
             .collect()
     }
@@ -756,6 +800,16 @@ impl MoveGrab {
             cursor_output: cursor_output.clone(),
         };
 
+        // Mark this window as grabbed so cleanup_orphaned_embeds won't orphan
+        // any embedded children while it's being dragged
+        if let Some(surface_id) = window
+            .active_window()
+            .wl_surface()
+            .map(|s| s.id().to_string())
+        {
+            mark_parent_grabbed(&surface_id);
+        }
+
         *seat
             .user_data()
             .get::<SeatMoveGrabState>()
@@ -810,6 +864,16 @@ impl Drop for MoveGrab {
                     .get::<SeatMoveGrabState>()
                     .and_then(|s| s.lock().unwrap().take())
             {
+                // Unmark this window as grabbed - cleanup can now orphan children if window closes
+                if let Some(surface_id) = grab_state
+                    .window
+                    .active_window()
+                    .wl_surface()
+                    .map(|s| s.id().to_string())
+                {
+                    unmark_parent_grabbed(&surface_id);
+                }
+
                 if grab_state.window.alive() {
                     let window_location =
                         (grab_state.location.to_i32_round() + grab_state.window_offset).as_global();

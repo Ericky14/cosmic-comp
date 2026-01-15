@@ -22,7 +22,7 @@ use crate::{
     },
     config::ScreenFilter,
     shell::{
-        CosmicMappedRenderElement, OverviewMode, SeatExt, Trigger, WorkspaceDelta,
+        CosmicMapped, CosmicMappedRenderElement, OverviewMode, SeatExt, Trigger, WorkspaceDelta,
         WorkspaceRenderElement,
         element::CosmicMappedKey,
         focus::{FocusTarget, Stage, render_input_order, target::WindowGroup},
@@ -72,10 +72,11 @@ use smithay::{
     },
     input::Seat,
     output::{Output, OutputModeSource, OutputNoMode},
+    reexports::wayland_server::Resource,
     utils::{
         IsAlive, Logical, Monotonic, Physical, Point, Rectangle, Scale, Size, Time, Transform,
     },
-    wayland::{dmabuf::get_dmabuf, session_lock::LockSurface},
+    wayland::{dmabuf::get_dmabuf, seat::WaylandFocus, session_lock::LockSurface},
 };
 
 #[cfg(feature = "debug")]
@@ -768,6 +769,10 @@ pub fn cursor_elements<'a, 'frame, R>(
     mode: CursorMode,
     exclude_dnd_icon: bool,
     skip_move_grab: bool,
+    embedded_children_for_grabbed: &[(
+        CosmicMapped,
+        crate::wayland::handlers::surface_embed::EmbedRenderInfo,
+    )],
 ) -> Vec<CosmicElement<R>>
 where
     R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
@@ -848,7 +853,12 @@ where
                 .unwrap()
                 .as_ref()
                 .map(|state| {
-                    state.render::<CosmicMappedRenderElement<R>, R>(renderer, output, theme)
+                    state.render::<CosmicMappedRenderElement<R>, R>(
+                        renderer,
+                        output,
+                        theme,
+                        embedded_children_for_grabbed,
+                    )
                 })
             {
                 elements.extend(grab_elements.into_iter().map(|elem| {
@@ -1035,6 +1045,57 @@ where
     }
     let theme = shell_ref.theme().clone();
     let scale = output.current_scale().fractional_scale();
+
+    // Gather embedded children for any move-grabbed window before dropping shell lock
+    // This allows us to render embedded windows following the dragged parent
+    let embedded_children_for_grabbed: Vec<(
+        CosmicMapped,
+        crate::wayland::handlers::surface_embed::EmbedRenderInfo,
+    )> = {
+        // Check if any seat has an active move grab and get the parent's surface_id
+        seats
+            .iter()
+            .find_map(|seat| {
+                seat.user_data()
+                    .get::<SeatMoveGrabState>()
+                    .and_then(|state| state.lock().ok())
+                    .and_then(|state| {
+                        state.as_ref().and_then(|s| {
+                            s.element()
+                                .active_window()
+                                .wl_surface()
+                                .map(|surf| surf.id().to_string())
+                        })
+                    })
+            })
+            .map(|parent_surface_id| {
+                // Get all embedded children for this parent (by surface_id)
+                let children =
+                    crate::wayland::handlers::surface_embed::get_children_for_parent_by_surface_id(
+                        &parent_surface_id,
+                    );
+                children
+                    .into_iter()
+                    .filter_map(|(child_surface_id, embed_info)| {
+                        // Find the CosmicMapped for this embedded child (by surface_id)
+                        shell_ref
+                            .workspaces
+                            .spaces()
+                            .flat_map(|s| s.mapped())
+                            .find(|mapped| {
+                                mapped
+                                    .active_window()
+                                    .wl_surface()
+                                    .map(|s| s.id().to_string() == child_surface_id)
+                                    .unwrap_or(false)
+                            })
+                            .map(|mapped| (mapped.clone(), embed_info))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
     // we don't want to hold a shell lock across `cursor_elements`,
     // that is prone to deadlock with the main-thread on some grabs.
     std::mem::drop(shell_ref);
@@ -1049,6 +1110,7 @@ where
         cursor_mode,
         *element_filter == ElementFilter::ExcludeWorkspaceOverview,
         matches!(element_filter, ElementFilter::BlurCapture(_)),
+        &embedded_children_for_grabbed,
     ));
 
     let shell = shell.read();

@@ -46,7 +46,7 @@ use smithay::{
     output::{Output, WeakOutput},
     reexports::{
         wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1,
-        wayland_server::{Client, protocol::wl_surface::WlSurface},
+        wayland_server::{Client, Resource, protocol::wl_surface::WlSurface},
     },
     utils::{IsAlive, Logical, Point, Rectangle, Serial, Size},
     wayland::{
@@ -1556,6 +1556,17 @@ impl Common {
 
             if let Some(mapped) = shell.element_for_surface(surface) {
                 mapped.on_commit(surface);
+
+                // Check if this is an embedded surface with animation sync active
+                let surface_id = surface.id().to_string();
+                if crate::wayland::handlers::surface_embed::has_embed_animation_sync(&surface_id) {
+                    // Get the committed buffer size from the window geometry
+                    let committed_size = mapped.active_window().geometry().size;
+                    crate::wayland::handlers::surface_embed::record_embed_commit(
+                        &surface_id,
+                        committed_size,
+                    );
+                }
             }
             if let Some(surface) = shell
                 .workspaces
@@ -1876,16 +1887,39 @@ impl Shell {
     }
 
     /// Close the focused keyboard focus target
+    /// If the target is an embedded window, close the parent instead
     pub fn close_focused(&self, focus_target: &KeyboardFocusTarget) {
         match focus_target {
             KeyboardFocusTarget::Group(_group) => {
                 //TODO: decide if we want close actions to apply to groups
             }
             KeyboardFocusTarget::Fullscreen(surface) => {
+                // Check if this surface is embedded - if so, close parent
+                if let Some(parent_surface_id) =
+                    crate::wayland::handlers::surface_embed::get_parent_surface_id(surface)
+                {
+                    // Find the parent element and close it
+                    if let Some(parent) = self.element_for_surface_id(&parent_surface_id) {
+                        parent.send_close();
+                        return;
+                    }
+                }
                 surface.close();
             }
             x => {
                 if let Some(mapped) = self.focused_element(x) {
+                    // Check if any window in the mapped element is embedded - if so, close parent
+                    for (surface, _) in mapped.windows() {
+                        if let Some(parent_surface_id) =
+                            crate::wayland::handlers::surface_embed::get_parent_surface_id(&surface)
+                        {
+                            // Find the parent element and close it
+                            if let Some(parent) = self.element_for_surface_id(&parent_surface_id) {
+                                parent.send_close();
+                                return;
+                            }
+                        }
+                    }
                     mapped.send_close();
                 }
             }
@@ -2043,6 +2077,56 @@ impl Shell {
                     set.workspaces
                         .iter()
                         .find_map(|w| w.element_for_surface(surface))
+                })
+        })
+    }
+
+    /// Find a mapped element by its WlSurface ObjectId string
+    /// Used for finding parent windows of embedded surfaces
+    pub fn element_for_surface_id(&self, surface_id: &str) -> Option<&CosmicMapped> {
+        self.workspaces.sets.values().find_map(|set| {
+            set.minimized_windows
+                .iter()
+                .find(|w| {
+                    w.windows().any(|s| {
+                        s.wl_surface()
+                            .map(|wl| wl.id().to_string() == surface_id)
+                            .unwrap_or(false)
+                    })
+                })
+                .and_then(|w| w.mapped())
+                .or_else(|| {
+                    set.sticky_layer.mapped().find(|w| {
+                        w.windows().any(|(s, _)| {
+                            s.wl_surface()
+                                .map(|wl| wl.id().to_string() == surface_id)
+                                .unwrap_or(false)
+                        })
+                    })
+                })
+                .or_else(|| {
+                    set.workspaces.iter().find_map(|w| {
+                        w.floating_layer
+                            .mapped()
+                            .find(|m| {
+                                m.windows().any(|(s, _)| {
+                                    s.wl_surface()
+                                        .map(|wl| wl.id().to_string() == surface_id)
+                                        .unwrap_or(false)
+                                })
+                            })
+                            .or_else(|| {
+                                w.tiling_layer.mapped().find_map(|(m, _)| {
+                                    m.windows()
+                                        .any(|(s, _)| {
+                                            s.wl_surface()
+                                                .map(|wl| wl.id().to_string() == surface_id)
+                                                .unwrap_or(false)
+                                        })
+                                        .then_some(m)
+                                })
+                            })
+                    })
                 })
         })
     }
@@ -4237,6 +4321,14 @@ impl Shell {
         client_driven: bool,
         loop_handle: &LoopHandle<'static, State>,
     ) {
+        // Don't allow maximizing embedded windows
+        if mapped
+            .windows()
+            .any(|(w, _)| crate::wayland::handlers::surface_embed::is_surface_embedded(&w))
+        {
+            return;
+        }
+
         self.unminimize_request(&mapped.active_window(), seat, loop_handle);
 
         let (original_layer, floating_layer, mut original_geometry) = if let Some(set) = self
@@ -4264,18 +4356,6 @@ impl Shell {
         // This ensures windows that start maximized remember their intended windowed size.
         if let Some(pending_size) = mapped.pending_size() {
             original_geometry.size = pending_size.as_local();
-            // Center the window on the output when unmaximizing
-            let output_geometry = floating_layer
-                .space
-                .outputs()
-                .next()
-                .map(|o| {
-                    let layers = smithay::desktop::layer_map_for_output(o);
-                    layers.non_exclusive_zone()
-                })
-                .unwrap_or_default();
-            original_geometry.loc.x = (output_geometry.size.w - original_geometry.size.w) / 2;
-            original_geometry.loc.y = (output_geometry.size.h - original_geometry.size.h) / 2;
         }
 
         let mut state = mapped.maximized_state.lock().unwrap();
@@ -4690,6 +4770,15 @@ impl Shell {
         CosmicSurface: PartialEq<S>,
     {
         let mapped = self.element_for_surface(surface).cloned()?;
+
+        // Don't allow fullscreening embedded windows
+        if mapped
+            .windows()
+            .any(|(w, _)| crate::wayland::handlers::surface_embed::is_surface_embedded(&w))
+        {
+            return None;
+        }
+
         let window;
 
         let old_fullscreen = if let Some((old_output, set)) = self

@@ -8,7 +8,7 @@ use crate::wayland::protocols::animated_resize::{
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Point, Rectangle, Size};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 impl AnimatedResizeHandler for State {
     fn animated_resize_state(&mut self) -> &mut AnimatedResizeState {
@@ -84,11 +84,36 @@ impl AnimatedResizeHandler for State {
         // Build target geometry - start with current position, change size
         let target_size: Size<i32, Local> = (target_width, target_height).into();
 
-        // Calculate position that keeps window within output bounds
-        // If resizing would cause overflow, adjust position to keep window on screen
-        let mut target_x = current_geo.loc.x;
+        // Calculate relative position of window center within output
+        // relative_x = 0.0 means window center is at left edge, 1.0 means right edge
+        let window_center_x = current_geo.loc.x + current_geo.size.w / 2;
+        let relative_x = window_center_x as f32 / output_geo.size.w as f32;
+
+        // Determine target position based on window's relative position:
+        // - If window is centered or to the right (relative_x >= 0.4), keep it centered during resize
+        // - If window is to the left (relative_x < 0.4), keep left position fixed (normal resize)
+        let mut target_x;
         let mut target_y = current_geo.loc.y;
 
+        const CENTER_THRESHOLD: f32 = 0.4;
+        if relative_x >= CENTER_THRESHOLD {
+            // Window is centered or to the right - calculate position to keep it centered
+            target_x = (output_geo.size.w - target_width) / 2;
+            target_y = (output_geo.size.h - target_height) / 2;
+            debug!(
+                relative_x,
+                "Window is centered/right (>= {}), will center during resize", CENTER_THRESHOLD
+            );
+        } else {
+            // Window is to the left - keep current position (resize from current location)
+            target_x = current_geo.loc.x;
+            debug!(
+                relative_x,
+                "Window is to the left (< {}), will resize without moving", CENTER_THRESHOLD
+            );
+        }
+
+        // Boundary constraints - keep window within output bounds
         // Check right edge overflow
         if target_x + target_width > output_geo.size.w {
             target_x = (output_geo.size.w - target_width).max(0);

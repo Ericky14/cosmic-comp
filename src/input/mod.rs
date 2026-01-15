@@ -58,7 +58,8 @@ use smithay::{
     },
     output::Output,
     reexports::{
-        input::Device as InputDevice, wayland_server::protocol::wl_shm::Format as ShmFormat,
+        input::Device as InputDevice,
+        wayland_server::{Resource, protocol::wl_shm::Format as ShmFormat},
     },
     utils::{Point, Rectangle, SERIAL_COUNTER, Serial},
     wayland::{
@@ -1846,6 +1847,55 @@ impl State {
             }
             seat.supressed_keys().add(&handle, None);
             return FilterResult::Intercept(None);
+        }
+
+        // Intercept window-control keys (F11, Alt+F4) for embedded windows and forward to parent
+        if event.state() == KeyState::Pressed {
+            let is_f11 = handle.modified_sym() == Keysym::F11;
+            let is_alt_f4 = handle.modified_sym() == Keysym::F4 && modifiers.alt;
+
+            if is_f11 || is_alt_f4 {
+                // Get current focus from keyboard again (since current_focus may have been moved)
+                if let Some(focus) = keyboard.current_focus() {
+                    // Check if focused window is embedded
+                    if let Some(surface) = focus.wl_surface() {
+                        let surface_id = surface.id().to_string();
+                        // Get parent info from embed map
+                        let parent_info = crate::wayland::handlers::surface_embed::EMBEDDED_APP_IDS
+                            .read()
+                            .ok()
+                            .and_then(|map| {
+                                map.get(&surface_id)
+                                    .map(|info| info.parent_surface_id.clone())
+                            });
+
+                        if let Some(parent_surface_id) = parent_info {
+                            // Find parent element (with shell lock released before set_focus)
+                            let parent_target = {
+                                let shell = self.common.shell.read();
+                                shell.element_for_surface_id(&parent_surface_id).cloned()
+                            };
+
+                            if let Some(parent) = parent_target {
+                                tracing::debug!(
+                                    key = ?handle.modified_sym(),
+                                    embedded_surface = %surface_id,
+                                    parent_surface = %parent_surface_id,
+                                    "Forwarding window-control key from embedded to parent"
+                                );
+                                // Send key to parent surface
+                                keyboard.set_focus(
+                                    self,
+                                    Some(KeyboardFocusTarget::from(parent)),
+                                    serial,
+                                );
+                                // Don't intercept - let it flow through to the now-focused parent
+                                return FilterResult::Forward;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if event.state() == KeyState::Pressed

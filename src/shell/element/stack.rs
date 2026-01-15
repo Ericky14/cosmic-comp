@@ -22,6 +22,7 @@ use crate::{
         iced::{IcedElement, Program},
         prelude::*,
     },
+    wayland::handlers::surface_embed::is_surface_embedded,
 };
 use calloop::LoopHandle;
 use cosmic::{
@@ -673,6 +674,11 @@ impl CosmicStack {
         self.0.with_program(|p| {
             let windows = p.windows.lock().unwrap();
             let active = p.active.load(Ordering::SeqCst);
+
+            if is_surface_embedded(&windows[active]) {
+                return None;
+            }
+
             let activated = p.activated.load(Ordering::Acquire);
             let theme = p.theme.lock().unwrap();
             let appearance = p.appearance_conf.lock().unwrap();
@@ -758,6 +764,7 @@ impl CosmicStack {
             let appearance = p.appearance_conf.lock().unwrap();
             let tiled = p.tiled.load(Ordering::Acquire);
             let maximized = windows[active].is_maximized(false);
+            let is_embedded = is_surface_embedded(&windows[active]);
 
             let round = (appearance.clip_tiled_windows || !tiled) && !maximized;
             let radii = if round {
@@ -776,7 +783,7 @@ impl CosmicStack {
             let window_key =
                 CosmicMappedKey(CosmicMappedKeyInner::Stack(Arc::downgrade(&self.0.0)));
 
-            let border = (!maximized).then(|| {
+            let border = (!maximized && !is_embedded).then(|| {
                 let (r, g, b, a) = theme.cosmic().bg_divider().into_components();
                 CosmicStackRenderElement::Border(IndicatorShader::element(
                     renderer,

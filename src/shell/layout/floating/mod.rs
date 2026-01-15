@@ -20,6 +20,7 @@ use smithay::{
     desktop::{PopupKind, Space, WindowSurfaceType, layer_map_for_output, space::SpaceElement},
     input::Seat,
     output::Output,
+    reexports::wayland_server::Resource,
     utils::{IsAlive, Logical, Point, Rectangle, Scale, Size},
     wayland::seat::WaylandFocus,
 };
@@ -466,6 +467,303 @@ impl FloatingLayout {
         self.map_internal(mapped, position, None, None)
     }
 
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Embedded child animation helpers
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /// Start animation sync tracking for all embedded children of a parent.
+    /// Call this at the beginning of a client-driven animation.
+    fn start_embed_animation_tracking(
+        &self,
+        parent_surface_id: Option<&String>,
+        parent_geometry: Rectangle<i32, Local>,
+    ) {
+        let Some(sid) = parent_surface_id else { return };
+
+        let embedded_children =
+            crate::wayland::handlers::surface_embed::get_children_for_parent_by_surface_id(sid);
+
+        for (embedded_surface_id, embed_info) in &embedded_children {
+            let initial_embed_size = if let Some(ref anchor) = embed_info.anchor_config {
+                anchor.calculate_geometry(parent_geometry.size.w, parent_geometry.size.h)
+            } else {
+                embed_info.geometry
+            };
+
+            crate::wayland::handlers::surface_embed::start_embed_animation_sync(
+                embedded_surface_id,
+                initial_embed_size.size,
+            );
+
+            tracing::debug!(
+                embedded_surface_id,
+                ?initial_embed_size,
+                "Started animation sync for embedded child"
+            );
+        }
+    }
+
+    /// Configure all embedded children to a given parent size.
+    /// If `record_for_animation` is true, records the configure for animation sync.
+    fn configure_embeds_to_parent_size(
+        &self,
+        parent_surface_id: Option<&String>,
+        parent_width: i32,
+        parent_height: i32,
+        record_for_animation: bool,
+    ) {
+        let Some(sid) = parent_surface_id else { return };
+
+        let embeds =
+            crate::wayland::handlers::surface_embed::update_embedded_geometry_for_parent_by_surface_id(
+                sid,
+                parent_width,
+                parent_height,
+            );
+
+        for (embedded_surface_id, new_geometry) in embeds {
+            if let Some(embedded_elem) = self.space.elements().find(|e| {
+                e.active_window()
+                    .wl_surface()
+                    .map(|s| s.id().to_string() == embedded_surface_id)
+                    .unwrap_or(false)
+            }) {
+                let global_geo = Rectangle::new(
+                    (new_geometry.loc.x, new_geometry.loc.y).into(),
+                    (new_geometry.size.w, new_geometry.size.h).into(),
+                );
+                embedded_elem.active_window().set_geometry(global_geo, 0);
+                embedded_elem.configure();
+
+                if record_for_animation {
+                    crate::wayland::handlers::surface_embed::record_embed_configure(
+                        &embedded_surface_id,
+                        new_geometry.size,
+                    );
+                }
+
+                tracing::debug!(
+                    embedded_surface_id,
+                    size = ?new_geometry.size,
+                    record_for_animation,
+                    "Configured embedded window"
+                );
+            }
+        }
+    }
+
+    /// Calculate the lookahead geometry for frame-ahead buffering.
+    /// This calculates where the animation will be ~16ms (one frame) ahead.
+    fn calculate_lookahead_geometry(
+        from: Rectangle<i32, Local>,
+        to: Rectangle<i32, Local>,
+    ) -> Rectangle<i32, Local> {
+        let lookahead_duration = std::time::Duration::from_millis(16);
+        let lookahead_progress =
+            (lookahead_duration.as_secs_f64() / ANIMATION_DURATION.as_secs_f64()).min(1.0);
+
+        ease(
+            EaseInOutCubic,
+            EaseRectangle(from),
+            EaseRectangle(to),
+            lookahead_progress,
+        )
+        .unwrap()
+    }
+
+    /// Calculate lookahead geometry based on animation progress plus estimated latency.
+    /// Used during animation updates to configure embedded windows ahead of time.
+    fn calculate_lookahead_for_latency(
+        previous_geometry: Rectangle<i32, Local>,
+        target_geometry: Rectangle<i32, Local>,
+        anim_start: Instant,
+        estimated_latency: std::time::Duration,
+    ) -> Rectangle<i32, Local> {
+        let now = Instant::now();
+        let lookahead_elapsed = now.duration_since(anim_start) + estimated_latency;
+        let lookahead_progress =
+            (lookahead_elapsed.as_secs_f64() / ANIMATION_DURATION.as_secs_f64()).min(1.0);
+
+        ease(
+            EaseInOutCubic,
+            EaseRectangle(previous_geometry),
+            EaseRectangle(target_geometry),
+            lookahead_progress,
+        )
+        .unwrap()
+    }
+
+    /// Render embedded children of a parent window.
+    /// Returns the render elements for all embedded children positioned relative to the parent.
+    fn render_embedded_children<R>(
+        &self,
+        renderer: &mut R,
+        parent_elem: &CosmicMapped,
+        parent_geometry: Rectangle<i32, Local>,
+        output_scale: f64,
+        alpha: f32,
+    ) -> Vec<CosmicMappedRenderElement<R>>
+    where
+        R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
+        R::TextureId: Send + Clone + 'static,
+        CosmicMappedRenderElement<R>: RenderElement<R>,
+        CosmicWindowRenderElement<R>: RenderElement<R>,
+        CosmicStackRenderElement<R>: RenderElement<R>,
+    {
+        let mut embedded_elements = Vec::new();
+
+        let parent_window = parent_elem.active_window();
+        let Some(parent_surface) = parent_window.wl_surface() else {
+            return embedded_elements;
+        };
+
+        let parent_surface_id = parent_surface.id().to_string();
+        let embedded_children =
+            crate::wayland::handlers::surface_embed::get_children_for_parent_by_surface_id(
+                &parent_surface_id,
+            );
+
+        for (embedded_surface_id, embed_info) in embedded_children {
+            // Find the embedded element in the space
+            let embedded_elem = self.space.elements().find(|e| {
+                e.active_window()
+                    .wl_surface()
+                    .map(|s| s.id().to_string() == embedded_surface_id)
+                    .unwrap_or(false)
+            });
+
+            let Some(embedded_elem) = embedded_elem else {
+                continue;
+            };
+
+            // Calculate actual embed geometry based on parent's (possibly animated) size
+            let actual_geometry = if let Some(ref anchor_config) = embed_info.anchor_config {
+                anchor_config.calculate_geometry(parent_geometry.size.w, parent_geometry.size.h)
+            } else {
+                embed_info.geometry
+            };
+
+            // Render the embedded window at parent position + embed offset
+            let embed_offset = smithay::utils::Point::<i32, smithay::utils::Logical>::from((
+                actual_geometry.loc.x,
+                actual_geometry.loc.y,
+            ));
+            let render_location = parent_geometry.loc.as_logical() + embed_offset;
+
+            // Use actual_geometry.size as clip size to handle resize transitions
+            let clip_size = Some(smithay::utils::Size::<i32, smithay::utils::Logical>::from(
+                (actual_geometry.size.w, actual_geometry.size.h),
+            ));
+
+            tracing::trace!(
+                embedded_app_id = %embedded_elem.active_window().app_id(),
+                parent_app_id = %parent_elem.active_window().app_id(),
+                parent_loc = ?parent_geometry.loc,
+                parent_size = ?parent_geometry.size,
+                embed_offset = ?embed_offset,
+                render_location = ?render_location,
+                clip_size = ?clip_size,
+                "Rendering embedded window in front of parent"
+            );
+
+            let elements = embedded_elem.render_elements(
+                renderer,
+                render_location.to_physical_precise_round(output_scale),
+                clip_size,
+                output_scale.into(),
+                alpha,
+                None,
+            );
+            embedded_elements.extend(elements);
+        }
+
+        embedded_elements
+    }
+
+    /// Update embedded children with lookahead sizes during animation.
+    /// This ensures embedded windows commit buffers for the next frame ahead of time.
+    fn update_embeds_with_lookahead(
+        &self,
+        mapped: &CosmicMapped,
+        previous_geometry: Rectangle<i32, Local>,
+        target_geometry: Rectangle<i32, Local>,
+    ) {
+        let parent_surface_id = mapped
+            .active_window()
+            .wl_surface()
+            .map(|s| s.id().to_string());
+
+        let Some(ref sid) = parent_surface_id else {
+            return;
+        };
+
+        let embedded_children =
+            crate::wayland::handlers::surface_embed::get_children_for_parent_by_surface_id(sid);
+
+        let anim_start = self
+            .animations
+            .get(mapped)
+            .map(|a| *a.start())
+            .unwrap_or_else(Instant::now);
+
+        for (embedded_surface_id, _embed_info) in &embedded_children {
+            let estimated_latency =
+                crate::wayland::handlers::surface_embed::get_embed_animation_sync(
+                    embedded_surface_id,
+                )
+                .map(|sync| sync.estimated_latency)
+                .unwrap_or(std::time::Duration::from_millis(16));
+
+            let lookahead_parent_geometry = Self::calculate_lookahead_for_latency(
+                previous_geometry,
+                target_geometry,
+                anim_start,
+                estimated_latency,
+            );
+
+            // Update embedded geometry for lookahead parent size
+            let lookahead_embeds =
+                crate::wayland::handlers::surface_embed::update_embedded_geometry_for_parent_by_surface_id(
+                    sid,
+                    lookahead_parent_geometry.size.w,
+                    lookahead_parent_geometry.size.h,
+                );
+
+            // Configure the specific embedded window to lookahead size
+            for (embed_id, new_geometry) in lookahead_embeds {
+                if &embed_id != embedded_surface_id {
+                    continue;
+                }
+
+                if let Some(embedded_elem) = self.space.elements().find(|e| {
+                    e.active_window()
+                        .wl_surface()
+                        .map(|s| s.id().to_string() == embed_id)
+                        .unwrap_or(false)
+                }) {
+                    let global_geo = Rectangle::new(
+                        (new_geometry.loc.x, new_geometry.loc.y).into(),
+                        (new_geometry.size.w, new_geometry.size.h).into(),
+                    );
+                    embedded_elem.active_window().set_geometry(global_geo, 0);
+                    embedded_elem.configure();
+
+                    crate::wayland::handlers::surface_embed::record_embed_configure(
+                        &embed_id,
+                        new_geometry.size,
+                    );
+
+                    tracing::trace!(
+                        embed_id,
+                        ?estimated_latency,
+                        lookahead_size = ?new_geometry.size,
+                        "Configured embedded with lookahead"
+                    );
+                }
+            }
+        }
+    }
+
     pub fn map_maximized(
         &mut self,
         mapped: CosmicMapped,
@@ -500,9 +798,24 @@ impl FloatingLayout {
         mapped.set_tiled(true);
         mapped.set_maximized(true);
 
+        let parent_surface_id = mapped
+            .active_window()
+            .wl_surface()
+            .map(|s| s.id().to_string());
+
         if client_driven && animate {
-            // For client-driven animation, start at current geometry
-            // and animate to target via configure events
+            // Client-driven: use frame-ahead buffering for embedded children
+            self.start_embed_animation_tracking(parent_surface_id.as_ref(), previous_geometry);
+
+            let lookahead_geometry =
+                Self::calculate_lookahead_geometry(previous_geometry, target_geometry);
+            self.configure_embeds_to_parent_size(
+                parent_surface_id.as_ref(),
+                lookahead_geometry.size.w,
+                lookahead_geometry.size.h,
+                true, // record for animation
+            );
+
             self.animations.insert(
                 mapped.clone(),
                 Animation::ClientDrivenResize {
@@ -512,45 +825,68 @@ impl FloatingLayout {
                     last_sent_size: previous_geometry.size,
                 },
             );
-            // Initial configure at current size (animation will update)
             mapped.set_geometry(previous_geometry.to_global(&output));
             mapped.configure();
         } else {
-            // Compositor-driven: set target geometry immediately
+            // Compositor-driven: configure embedded children to final target size
+            self.configure_embeds_to_parent_size(
+                parent_surface_id.as_ref(),
+                target_geometry.size.w,
+                target_geometry.size.h,
+                false, // no animation tracking
+            );
+
             mapped.set_geometry(target_geometry.to_global(&output));
             mapped.configure();
 
             if animate {
-                if let Some(existing_anim) = self.animations.get_mut(&mapped) {
-                    match existing_anim {
-                        Animation::Unminimize {
-                            target_geometry: tg,
-                            ..
-                        } => {
-                            *tg = target_geometry;
-                        }
-                        Animation::ClientDrivenResize {
-                            target_geometry: tg,
-                            ..
-                        } => {
-                            *tg = target_geometry;
-                        }
-                        Animation::Minimize { .. } | Animation::Tiled { .. } => {}
-                    }
-                } else {
-                    self.animations.insert(
-                        mapped.clone(),
-                        Animation::Tiled {
-                            start: Instant::now(),
-                            previous_geometry,
-                        },
-                    );
-                }
+                self.update_or_insert_tiled_animation(&mapped, previous_geometry, target_geometry);
             } else {
                 self.animations.remove(&mapped);
             }
         }
 
+        self.finalize_maximize_map(mapped, target_geometry);
+    }
+
+    /// Update an existing animation's target or insert a new Tiled animation
+    fn update_or_insert_tiled_animation(
+        &mut self,
+        mapped: &CosmicMapped,
+        previous_geometry: Rectangle<i32, Local>,
+        target_geometry: Rectangle<i32, Local>,
+    ) {
+        if let Some(existing_anim) = self.animations.get_mut(mapped) {
+            match existing_anim {
+                Animation::Unminimize {
+                    target_geometry: tg,
+                    ..
+                }
+                | Animation::ClientDrivenResize {
+                    target_geometry: tg,
+                    ..
+                } => {
+                    *tg = target_geometry;
+                }
+                Animation::Minimize { .. } | Animation::Tiled { .. } => {}
+            }
+        } else {
+            self.animations.insert(
+                mapped.clone(),
+                Animation::Tiled {
+                    start: Instant::now(),
+                    previous_geometry,
+                },
+            );
+        }
+    }
+
+    /// Finalize mapping a maximized window (common cleanup for both animation modes)
+    fn finalize_maximize_map(
+        &mut self,
+        mapped: CosmicMapped,
+        target_geometry: Rectangle<i32, Local>,
+    ) {
         if let Some(pos) = self.spawn_order.iter().position(|m| m == &mapped) {
             self.spawn_order.truncate(pos);
         }
@@ -585,6 +921,23 @@ impl FloatingLayout {
             .element_geometry(&mapped)
             .map(RectExt::as_local)
             .unwrap_or(target_geometry);
+
+        let parent_surface_id = mapped
+            .active_window()
+            .wl_surface()
+            .map(|s| s.id().to_string());
+
+        // Start animation sync and configure embeds to lookahead size
+        self.start_embed_animation_tracking(parent_surface_id.as_ref(), current_geometry);
+
+        let lookahead_geometry =
+            Self::calculate_lookahead_geometry(current_geometry, target_geometry);
+        self.configure_embeds_to_parent_size(
+            parent_surface_id.as_ref(),
+            lookahead_geometry.size.w,
+            lookahead_geometry.size.h,
+            true, // record for animation
+        );
 
         // Start animation from current to target
         self.animations.insert(
@@ -942,6 +1295,71 @@ impl FloatingLayout {
         self.space.element_geometry(elem).map(RectExt::as_local)
     }
 
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Embedded window hit-testing helpers
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /// Find an embedded element under the given location.
+    /// Returns the element and its render location if found.
+    fn embedded_element_under(
+        &self,
+        location: Point<f64, Local>,
+    ) -> Option<(&CosmicMapped, Point<i32, Logical>)> {
+        for elem in self.space.elements() {
+            if let Some(embed_info) = elem.windows().find_map(|(w, _)| {
+                crate::wayland::handlers::surface_embed::get_embed_render_info(&w)
+            }) {
+                if let Some(render_location) =
+                    self.calculate_embed_render_location(&embed_info, location)
+                {
+                    return Some((elem, render_location));
+                }
+            }
+        }
+        None
+    }
+
+    /// Calculate the render location of an embedded window if the given point is within its bounds.
+    /// Returns None if the point is outside the embedded window.
+    fn calculate_embed_render_location(
+        &self,
+        embed_info: &crate::wayland::handlers::surface_embed::EmbedRenderInfo,
+        location: Point<f64, Local>,
+    ) -> Option<Point<i32, Logical>> {
+        let parent_geo = self
+            .space
+            .elements()
+            .find(|e| {
+                e.active_window()
+                    .wl_surface()
+                    .map(|s| s.id().to_string() == embed_info.parent_surface_id)
+                    .unwrap_or(false)
+            })
+            .and_then(|parent| self.space.element_geometry(parent))?;
+
+        let actual_geometry = embed_info
+            .anchor_config
+            .as_ref()
+            .map(|anchor| anchor.calculate_geometry(parent_geo.size.w, parent_geo.size.h))
+            .unwrap_or(embed_info.geometry);
+
+        let render_location = parent_geo.loc + actual_geometry.loc;
+        let embedded_bounds = Rectangle::new(render_location, actual_geometry.size);
+
+        if embedded_bounds.to_f64().contains(location.as_logical()) {
+            Some(render_location)
+        } else {
+            None
+        }
+    }
+
+    /// Check if an element is embedded (has embed render info).
+    fn is_embedded(elem: &CosmicMapped) -> bool {
+        elem.windows().any(|(w, _)| {
+            crate::wayland::handlers::surface_embed::get_embed_render_info(&w).is_some()
+        })
+    }
+
     pub fn popup_element_under(&self, location: Point<f64, Local>) -> Option<KeyboardFocusTarget> {
         self.space
             .elements()
@@ -977,9 +1395,26 @@ impl FloatingLayout {
         &self,
         location: Point<f64, Local>,
     ) -> Option<KeyboardFocusTarget> {
+        // First check embedded windows - they render on top and should get keyboard focus priority
+        if let Some((elem, render_location)) = self.embedded_element_under(location) {
+            let render_location_local = render_location.as_local().to_f64();
+            let point = location - render_location_local;
+            if elem
+                .focus_under(
+                    point.as_logical(),
+                    WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
+                )
+                .is_some()
+            {
+                return Some(elem.clone().into());
+            }
+        }
+
+        // Then check regular (non-embedded) windows
         self.space
             .elements()
             .rev()
+            .filter(|e| !Self::is_embedded(e))
             .map(|e| {
                 (
                     e,
@@ -1042,9 +1477,23 @@ impl FloatingLayout {
         &self,
         location: Point<f64, Local>,
     ) -> Option<(PointerFocusTarget, Point<f64, Local>)> {
+        // First check embedded windows - they render on top and should get priority
+        if let Some((elem, render_location)) = self.embedded_element_under(location) {
+            let render_location_local = render_location.as_local().to_f64();
+            let point = location - render_location_local;
+            if let Some((surface, surface_offset)) = elem.focus_under(
+                point.as_logical(),
+                WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
+            ) {
+                return Some((surface, render_location_local + surface_offset.as_local()));
+            }
+        }
+
+        // Then check regular (non-embedded) windows
         self.space
             .elements()
             .rev()
+            .filter(|e| !Self::is_embedded(e))
             .map(|e| {
                 (
                     e,
@@ -1581,6 +2030,13 @@ impl FloatingLayout {
             self.spawn_order.truncate(pos);
         }
 
+        // Cleanup: Check if any parent windows that had embedded children are now gone
+        // If so, clear the embedded state so those windows become visible again
+        self.cleanup_orphaned_embeds();
+
+        // Update embedded window geometries based on parent window sizes
+        self.update_embedded_geometries();
+
         for element in self
             .space
             .elements()
@@ -1592,6 +2048,107 @@ impl FloatingLayout {
             // TODO what about windows leaving to the top with no headerbar to drag? can that happen? (Probably if the user is moving outputs down)
             *element.last_geometry.lock().unwrap() = None;
             self.map_internal(element, None, None, None);
+        }
+    }
+
+    /// Cleanup orphaned embedded surfaces (where parent has closed)
+    fn cleanup_orphaned_embeds(&mut self) {
+        // Get all current parent surface_ids in the space
+        let current_parent_surface_ids: std::collections::HashSet<String> = self
+            .space
+            .elements()
+            .filter_map(|e| e.active_window().wl_surface().map(|s| s.id().to_string()))
+            .collect();
+
+        // Check each embedded surface and clear if its parent is gone
+        for elem in self.space.elements() {
+            let surface_id: Option<String> = elem
+                .active_window()
+                .wl_surface()
+                .map(|s| s.id().to_string());
+
+            if let Some(ref sid) = surface_id {
+                if let Some(embed_info) =
+                    crate::wayland::handlers::surface_embed::get_embed_render_info(
+                        &elem.active_window(),
+                    )
+                {
+                    // This element is embedded - check if its parent still exists (by surface_id)
+                    // Also check if parent is currently being grabbed (then it's not in space.elements())
+                    let parent_in_space =
+                        current_parent_surface_ids.contains(&embed_info.parent_surface_id);
+                    let parent_grabbed = crate::wayland::handlers::surface_embed::is_parent_grabbed(
+                        &embed_info.parent_surface_id,
+                    );
+
+                    if !parent_in_space && !parent_grabbed {
+                        tracing::info!(
+                            "Parent surface '{}' no longer exists (not in space, not grabbed), clearing embed for surface '{}' (app_id='{}')",
+                            embed_info.parent_surface_id,
+                            sid,
+                            embed_info.embedded_app_id
+                        );
+                        crate::wayland::handlers::surface_embed::unmark_surface_embedded(sid);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Update embedded window geometries when parent windows resize
+    fn update_embedded_geometries(&mut self) {
+        // Collect parent windows and their children that need updating
+        let updates: Vec<_> = self
+            .space
+            .elements()
+            .filter_map(|elem| {
+                let surface_id = elem.active_window().wl_surface()?.id().to_string();
+                let geometry = self.space.element_geometry(elem)?;
+                // Check if this window has any embedded children (by surface_id)
+                let children =
+                    crate::wayland::handlers::surface_embed::get_children_for_parent_by_surface_id(
+                        &surface_id,
+                    );
+                if children.is_empty() {
+                    return None;
+                }
+                Some((surface_id, geometry.size, children))
+            })
+            .collect();
+
+        // For each parent, update embedded geometry and configure embedded windows
+        for (parent_surface_id, parent_size, _children) in updates {
+            let updated =
+                crate::wayland::handlers::surface_embed::update_embedded_geometry_for_parent_by_surface_id(
+                    &parent_surface_id,
+                    parent_size.w,
+                    parent_size.h,
+                );
+
+            // Configure embedded windows with new sizes
+            for (embedded_surface_id, new_geometry) in updated {
+                // Find the embedded window in the space by matching surface ID
+                if let Some(embedded_elem) = self.space.elements().find(|e| {
+                    e.active_window()
+                        .wl_surface()
+                        .map(|s| s.id().to_string() == embedded_surface_id)
+                        .unwrap_or(false)
+                }) {
+                    // Set the embedded window's geometry to match the new calculated size
+                    let global_geo = Rectangle::new(
+                        (new_geometry.loc.x, new_geometry.loc.y).into(),
+                        (new_geometry.size.w, new_geometry.size.h).into(),
+                    );
+                    embedded_elem.active_window().set_geometry(global_geo, 0);
+                    embedded_elem.configure();
+                    tracing::trace!(
+                        "Configured embedded '{}' to new size {}x{}",
+                        embedded_surface_id,
+                        new_geometry.size.w,
+                        new_geometry.size.h
+                    );
+                }
+            }
         }
     }
 
@@ -1662,22 +2219,33 @@ impl FloatingLayout {
             })
             .collect();
 
-        // Send configures and update last_sent_size
+        // Send configures and update last_sent_size, also update embedded children with lookahead
         if let Some(ref output) = output {
             for (mapped, geometry) in &updates {
                 mapped.set_geometry(geometry.to_global(output));
                 mapped.force_configure();
 
-                // Update last_sent_size
-                if let Some(Animation::ClientDrivenResize { last_sent_size, .. }) =
-                    self.animations.get_mut(mapped)
-                {
-                    *last_sent_size = geometry.size;
-                }
+                // Update last_sent_size and get animation info for embedded lookahead
+                let (previous_geometry, target_geometry) =
+                    if let Some(Animation::ClientDrivenResize {
+                        last_sent_size,
+                        previous_geometry,
+                        target_geometry,
+                        ..
+                    }) = self.animations.get_mut(mapped)
+                    {
+                        *last_sent_size = geometry.size;
+                        (*previous_geometry, *target_geometry)
+                    } else {
+                        continue;
+                    };
+
+                // Update embedded children with lookahead sizes
+                self.update_embeds_with_lookahead(mapped, previous_geometry, target_geometry);
             }
         }
 
-        // Before removing completed animations, finalize their geometry
+        // Before removing completed animations, finalize their geometry and stop embed sync
         if let Some(ref output) = output {
             let completed: Vec<_> = self
                 .animations
@@ -1711,6 +2279,20 @@ impl FloatingLayout {
                 // Also update the space's element location
                 self.space
                     .map_element(mapped.clone(), target_geometry.loc.as_logical(), false);
+
+                // Stop animation sync for embedded children
+                let parent_surface_id = mapped
+                    .active_window()
+                    .wl_surface()
+                    .map(|s| s.id().to_string());
+                let embedded_children = parent_surface_id
+                    .map(|sid| crate::wayland::handlers::surface_embed::get_children_for_parent_by_surface_id(&sid))
+                    .unwrap_or_default();
+                for (embedded_surface_id, _) in embedded_children {
+                    crate::wayland::handlers::surface_embed::stop_embed_animation_sync(
+                        &embedded_surface_id,
+                    );
+                }
             }
         }
 
@@ -2047,6 +2629,21 @@ impl FloatingLayout {
             .chain(self.space.elements().rev())
             .enumerate()
         {
+            // Check if this is an embedded window - if so, get the embed render info
+            let embed_info = elem.windows().find_map(|(w, _)| {
+                crate::wayland::handlers::surface_embed::get_embed_render_info(&w)
+            });
+
+            // For now, skip embedded windows - we'll render them separately
+            // TODO: Render embedded windows at their parent position + offset
+            if embed_info.is_some() {
+                tracing::info!(
+                    app_id = %elem.active_window().app_id(),
+                    "Skipping embedded window from floating render (will render at parent)"
+                );
+                continue;
+            }
+
             // Convert front-to-back index to back-to-front z-index
             // Index 0 in iteration = topmost window = z-index (total-1)
             // Index (total-1) in iteration = bottom window = z-index 0
@@ -2327,7 +2924,14 @@ impl FloatingLayout {
                 }
             }
 
-            elements.extend(window_elements);
+            // Render embedded children in front of parent (they'll be on top in the z-order)
+            let embedded_elements =
+                self.render_embedded_children(renderer, elem, geometry, output_scale, alpha);
+
+            // Combine: embedded first (on top), then parent's elements (behind)
+            let mut all_window_elements = embedded_elements;
+            all_window_elements.extend(window_elements);
+            elements.extend(all_window_elements);
         }
 
         elements

@@ -420,6 +420,37 @@ fn update_focus_state(
 }
 
 fn raise_with_children(floating_layer: &mut FloatingLayout, focused: &CosmicMapped) {
+    // Check if this is an embedded window - if so, raise its parent instead
+    let focused_is_embedded = focused
+        .windows()
+        .any(|(w, _)| crate::wayland::handlers::surface_embed::is_surface_embedded(&w));
+
+    if focused_is_embedded {
+        // Find the parent of this embedded window and raise it
+        if let Some(embed_info) = focused
+            .windows()
+            .find_map(|(w, _)| crate::wayland::handlers::surface_embed::get_embed_render_info(&w))
+        {
+            // Find the parent element by surface_id
+            let parent = floating_layer
+                .space
+                .elements()
+                .find(|e| {
+                    e.active_window()
+                        .wl_surface()
+                        .map(|s| s.id().to_string() == embed_info.parent_surface_id)
+                        .unwrap_or(false)
+                })
+                .cloned();
+
+            if let Some(parent) = parent {
+                // Raise the parent (which will also render the embedded window on top of it)
+                raise_with_children(floating_layer, &parent);
+            }
+        }
+        return;
+    }
+
     if floating_layer.mapped().any(|m| m == focused) {
         floating_layer.space.raise_element(focused, true);
         for element in floating_layer

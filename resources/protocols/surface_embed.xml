@@ -46,6 +46,32 @@
       <arg name="toplevel_id" type="string"
            summary="the identifier of the toplevel to embed"/>
     </request>
+
+    <request name="embed_toplevel_by_pid">
+      <description summary="embed a foreign toplevel by process ID">
+        Create an embedded surface view for a foreign toplevel window
+        identified by its process ID. This is useful when the parent
+        application spawns a child process and wants to embed its window
+        without needing to discover it via the toplevel-list protocol.
+
+        The compositor will monitor for new toplevels from the specified
+        PID. When a matching toplevel appears, it will be embedded.
+        
+        If no toplevel from the specified PID appears within a reasonable
+        timeout (e.g. 30 seconds), the embedded surface object becomes inert
+        and a 'closed' event is sent.
+
+        The parent surface must belong to the requesting client.
+        The pid should be a child process of the requesting client.
+      </description>
+      <arg name="id" type="new_id" interface="zcosmic_embedded_surface_v1"/>
+      <arg name="parent" type="object" interface="wl_surface"
+           summary="the surface to embed into"/>
+      <arg name="pid" type="uint"
+           summary="the process ID of the application to embed"/>
+      <arg name="app_id" type="string"
+           summary="expected app_id for verification (optional, can be empty)"/>
+    </request>
   </interface>
 
   <interface name="zcosmic_embedded_surface_v1" version="1">
@@ -74,6 +100,49 @@
       </description>
     </request>
 
+    <enum name="anchor" bitfield="true">
+      <description summary="anchor edges for positioning">
+        These flags specify which edges of the parent surface the embedded
+        surface should be anchored to. The compositor will automatically
+        calculate the position based on the anchor edges and margins.
+      </description>
+      <entry name="none" value="0" summary="no anchoring, use absolute position"/>
+      <entry name="top" value="1" summary="anchor to top edge"/>
+      <entry name="bottom" value="2" summary="anchor to bottom edge"/>
+      <entry name="left" value="4" summary="anchor to left edge"/>
+      <entry name="right" value="8" summary="anchor to right edge"/>
+    </enum>
+
+    <request name="set_anchor">
+      <description summary="set anchor-based positioning">
+        Set the embedded surface position using anchor-based positioning.
+        This is an alternative to set_geometry that allows the compositor
+        to automatically calculate the position based on parent size.
+
+        The anchor parameter specifies which edges to anchor to. Margins
+        specify the distance from each edge. Width and height specify the
+        size of the embed region.
+
+        For example, to anchor to top-right with margins:
+        - anchor = top | right
+        - margin_top = distance from parent top
+        - margin_right = distance from parent right edge
+        - width/height = size of embed region
+
+        If both opposing edges are anchored (e.g., left and right), the
+        embed will stretch between them minus the margins.
+
+        This request overrides any previous set_geometry call.
+      </description>
+      <arg name="anchor" type="uint" enum="anchor" summary="anchor edge flags"/>
+      <arg name="margin_top" type="int" summary="margin from top edge"/>
+      <arg name="margin_right" type="int" summary="margin from right edge"/>
+      <arg name="margin_bottom" type="int" summary="margin from bottom edge"/>
+      <arg name="margin_left" type="int" summary="margin from left edge"/>
+      <arg name="width" type="int" summary="width of embed region (0 to stretch)"/>
+      <arg name="height" type="int" summary="height of embed region (0 to stretch)"/>
+    </request>
+
     <request name="set_geometry">
       <description summary="set the embed region geometry">
         Set the position and size of the embedded surface within the
@@ -82,11 +151,30 @@
 
         The geometry is in surface-local coordinates of the parent.
         Width and height must be positive.
+        
+        This request uses absolute positioning. For anchor-based positioning
+        that automatically adjusts to parent size, use set_anchor instead.
       </description>
       <arg name="x" type="int" summary="x position in parent surface"/>
       <arg name="y" type="int" summary="y position in parent surface"/>
       <arg name="width" type="int" summary="width of embed region"/>
       <arg name="height" type="int" summary="height of embed region"/>
+    </request>
+
+    <request name="set_corner_radius">
+      <description summary="set the corner radius for the embedded surface">
+        Set the corner radius for clipping the embedded surface. This allows
+        the parent to specify rounded corners that match its own UI.
+        
+        Each corner can have a different radius. Values are in logical pixels.
+        A value of 0 means no rounding for that corner.
+        
+        Default is 0 for all corners (square corners).
+      </description>
+      <arg name="top_left" type="uint" summary="top-left corner radius"/>
+      <arg name="top_right" type="uint" summary="top-right corner radius"/>
+      <arg name="bottom_right" type="uint" summary="bottom-right corner radius"/>
+      <arg name="bottom_left" type="uint" summary="bottom-left corner radius"/>
     </request>
 
     <request name="set_interactive">

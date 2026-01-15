@@ -17,6 +17,7 @@ use crate::{
         iced::{IcedElement, Program},
         prelude::*,
     },
+    wayland::handlers::surface_embed::{get_embed_render_info, is_surface_embedded},
 };
 use calloop::LoopHandle;
 use cosmic::iced::{Color, Task};
@@ -317,7 +318,11 @@ impl CosmicWindow {
             let mut offset = Point::from((0., 0.));
             let mut window_ui = None;
             let has_ssd = p.has_ssd(false);
-            if (has_ssd || p.has_tiled_state())
+            let has_blur = p.window.has_blur();
+            let is_embedded = is_surface_embedded(&p.window);
+
+            if (has_ssd || p.has_tiled_state() || has_blur)
+                && !is_embedded
                 && surface_type.contains(WindowSurfaceType::TOPLEVEL)
             {
                 let geo = p.window.geometry();
@@ -422,6 +427,10 @@ impl CosmicWindow {
         C: From<CosmicWindowRenderElement<R>>,
     {
         self.0.with_program(|p| {
+            if is_surface_embedded(&p.window) {
+                return None;
+            }
+
             let has_ssd = p.has_ssd(false);
             let is_tiled = p.is_tiled();
             let activated = p.window.is_activated(false);
@@ -507,12 +516,16 @@ impl CosmicWindow {
         R::TextureId: Send + Clone + 'static,
         C: From<CosmicWindowRenderElement<R>>,
     {
+        let embed_render_info = self.0.with_program(|p| get_embed_render_info(&p.window));
+        let is_embedded = embed_render_info.is_some();
+        let embed_corner_radius = embed_render_info.map(|info| info.corner_radius);
+
         let (has_ssd, is_tiled, is_maximized, mut radii, appearance) = self.0.with_program(|p| {
             (
                 p.has_ssd(false),
                 p.is_tiled(),
                 p.window.is_maximized(false),
-                [super::DEFAULT_WINDOW_CORNER_RADIUS; 4],
+                embed_corner_radius.unwrap_or([super::DEFAULT_WINDOW_CORNER_RADIUS; 4]),
                 *p.appearance_conf.lock().unwrap(),
             )
         });
@@ -552,7 +565,7 @@ impl CosmicWindow {
             geo.size = geo.size.clamp(Size::default(), max_size.to_f64());
         }
 
-        if (has_ssd || clip) && !is_maximized {
+        if (has_ssd || clip) && !is_maximized && !is_embedded {
             let window_key =
                 CosmicMappedKey(CosmicMappedKeyInner::Window(Arc::downgrade(&self.0.0)));
 
@@ -850,8 +863,10 @@ impl SpaceElement for CosmicWindow {
         self.0.with_program(|p| {
             let mut bbox = SpaceElement::bbox(&p.window);
             let has_ssd = p.has_ssd(false);
+            let has_blur = p.window.has_blur();
+            let is_embedded = is_surface_embedded(&p.window);
 
-            if has_ssd || p.has_tiled_state() {
+            if (has_ssd || p.has_tiled_state() || has_blur) && !is_embedded {
                 bbox.loc -= Point::from((RESIZE_BORDER, RESIZE_BORDER));
                 bbox.size += Size::from((RESIZE_BORDER * 2, RESIZE_BORDER * 2));
             }
@@ -969,8 +984,13 @@ impl PointerTarget<State> for CosmicWindow {
     fn enter(&self, seat: &Seat<State>, data: &mut State, event: &MotionEvent) {
         let mut event = event.clone();
         self.0.with_program(|p| {
+            if is_surface_embedded(&p.window) {
+                return;
+            }
+
             let has_ssd = p.has_ssd(false);
-            if has_ssd || p.has_tiled_state() {
+            let has_blur = p.window.has_blur();
+            if has_ssd || p.has_tiled_state() || has_blur {
                 let Some(next) = Focus::under(
                     &p.window,
                     if has_ssd { SSD_HEIGHT } else { 0 },
@@ -995,8 +1015,12 @@ impl PointerTarget<State> for CosmicWindow {
     fn motion(&self, seat: &Seat<State>, data: &mut State, event: &MotionEvent) {
         let mut event = event.clone();
         self.0.with_program(|p| {
+            if is_surface_embedded(&p.window) {
+                return;
+            }
             let has_ssd = p.has_ssd(false);
-            if has_ssd || p.has_tiled_state() {
+            let has_blur = p.window.has_blur();
+            if has_ssd || p.has_tiled_state() || has_blur {
                 let Some(next) = Focus::under(
                     &p.window,
                     if has_ssd { SSD_HEIGHT } else { 0 },

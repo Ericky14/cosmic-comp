@@ -847,7 +847,14 @@ impl XwmHandler for State {
                 &mut self.common.workspace_state,
                 &self.common.event_loop_handle,
             );
+            // Drop shell lock before checking pending embeds
+            std::mem::drop(shell);
+            
+            // Check if this window matches any pending PID-based embed requests
+            self.check_pending_pid_embeds_for_window(&window);
+            
             if let Some(target) = res {
+                let shell = self.common.shell.read();
                 let seat = shell.seats.last_active().clone();
                 std::mem::drop(shell);
                 Shell::set_focus(self, Some(&target), &seat, None, false);

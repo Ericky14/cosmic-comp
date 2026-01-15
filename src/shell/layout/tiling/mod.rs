@@ -5131,6 +5131,10 @@ fn render_old_tree(
             )
             .filter(|(mapped, _, _, _)| !mapped.is_maximized(false))
             .filter(|(mapped, _, _, _)| {
+                // Skip embedded windows - they are rendered inside their parent window
+                !mapped.windows().any(|(w, _)| crate::wayland::handlers::surface_embed::is_surface_embedded(&w))
+            })
+            .filter(|(mapped, _, _, _)| {
                 if let Some(root) = target_tree.root_node_id() {
                     is_swap_mode
                         || !target_tree
@@ -5219,6 +5223,11 @@ where
         swap_desc.as_ref(),
         |_node_id, data, geo, _original_geo, alpha, _| {
             if let Data::Mapped { mapped, .. } = data {
+                // Skip embedded windows - they are rendered inside their parent window
+                if mapped.windows().any(|(w, _)| crate::wayland::handlers::surface_embed::is_surface_embedded(&w)) {
+                    return;
+                }
+
                 let elem_geometry = mapped.geometry().to_physical_precise_round(output_scale);
 
                 popup_elements.extend(
@@ -5565,6 +5574,11 @@ where
             }
 
             if let Data::Mapped { mapped, .. } = data {
+                // Skip embedded windows - they are rendered inside their parent window
+                if mapped.windows().any(|(w, _)| crate::wayland::handlers::surface_embed::is_surface_embedded(&w)) {
+                    return;
+                }
+
                 let elem_geometry = mapped.geometry().to_physical_precise_round(output_scale);
 
                 let scale = geo.size.to_f64() / original_geo.size.to_f64();

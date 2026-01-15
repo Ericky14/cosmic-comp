@@ -268,6 +268,10 @@ pub struct Common {
     pub image_capture_source_state: ImageCaptureSourceState,
     pub screencopy_state: ScreencopyState,
     pub surface_embed_state: SurfaceEmbedManagerState,
+    /// Pending PID-based embed requests waiting for matching toplevels
+    pub pending_pid_embeds: std::collections::HashMap<u32, Vec<crate::wayland::protocols::surface_embed::zcosmic_embedded_surface_v1::ZcosmicEmbeddedSurfaceV1>>,
+    /// Currently embedded surfaces keyed by app_id -> (embed object, parent surface weak ref, geometry)
+    pub embedded_surfaces: std::collections::HashMap<String, (crate::wayland::protocols::surface_embed::zcosmic_embedded_surface_v1::ZcosmicEmbeddedSurfaceV1, smithay::reexports::wayland_server::Weak<WlSurface>, smithay::utils::Rectangle<i32, smithay::utils::Logical>)>,
     pub seat_state: SeatState<State>,
     pub session_lock_manager_state: SessionLockManagerState,
     pub idle_notifier_state: IdleNotifierState<State>,
@@ -771,6 +775,8 @@ impl State {
                 image_capture_source_state,
                 screencopy_state,
                 surface_embed_state,
+                pending_pid_embeds: std::collections::HashMap::new(),
+                embedded_surfaces: std::collections::HashMap::new(),
                 shm_state,
                 cursor_shape_manager_state,
                 seat_state,
