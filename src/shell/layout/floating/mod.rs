@@ -633,6 +633,18 @@ impl FloatingLayout {
             });
 
             let Some(embedded_elem) = embedded_elem else {
+                let output_name = self
+                    .space
+                    .outputs()
+                    .next()
+                    .map(|o| o.name())
+                    .unwrap_or_else(|| "unknown".to_string());
+                tracing::warn!(
+                    parent_app_id = %parent_elem.active_window().app_id(),
+                    embedded_surface_id = %embedded_surface_id,
+                    output = %output_name,
+                    "Embedded child not found in this space - may be on different output"
+                );
                 continue;
             };
 
@@ -655,7 +667,7 @@ impl FloatingLayout {
                 (actual_geometry.size.w, actual_geometry.size.h),
             ));
 
-            tracing::trace!(
+            tracing::debug!(
                 embedded_app_id = %embedded_elem.active_window().app_id(),
                 parent_app_id = %parent_elem.active_window().app_id(),
                 parent_loc = ?parent_geometry.loc,
@@ -2258,14 +2270,8 @@ impl FloatingLayout {
     }
 
     /// Cleanup orphaned embedded surfaces (where parent has closed)
+    /// Uses global embed registry to verify parent is still valid (works across outputs)
     fn cleanup_orphaned_embeds(&mut self) {
-        // Get all current parent surface_ids in the space
-        let current_parent_surface_ids: std::collections::HashSet<String> = self
-            .space
-            .elements()
-            .filter_map(|e| e.active_window().wl_surface().map(|s| s.id().to_string()))
-            .collect();
-
         // Check each embedded surface and clear if its parent is gone
         for elem in self.space.elements() {
             let surface_id: Option<String> = elem
@@ -2279,17 +2285,20 @@ impl FloatingLayout {
                         &elem.active_window(),
                     )
                 {
-                    // This element is embedded - check if its parent still exists (by surface_id)
-                    // Also check if parent is currently being grabbed (then it's not in space.elements())
-                    let parent_in_space =
-                        current_parent_surface_ids.contains(&embed_info.parent_surface_id);
+                    // This element is embedded - check if its parent still exists
+                    // Check globally: parent is valid if it has embeds registered OR is being grabbed
+                    let parent_valid =
+                        crate::wayland::handlers::surface_embed::is_valid_embed_parent(
+                            &embed_info.parent_surface_id,
+                        );
                     let parent_grabbed = crate::wayland::handlers::surface_embed::is_parent_grabbed(
                         &embed_info.parent_surface_id,
                     );
 
-                    if !parent_in_space && !parent_grabbed {
+                    // Only clear if parent is not found anywhere
+                    if !parent_valid && !parent_grabbed {
                         tracing::info!(
-                            "Parent surface '{}' no longer exists (not in space, not grabbed), clearing embed for surface '{}' (app_id='{}')",
+                            "Parent surface '{}' no longer valid (not in global registry, not grabbed), clearing embed for surface '{}' (app_id='{}')",
                             embed_info.parent_surface_id,
                             sid,
                             embed_info.embedded_app_id

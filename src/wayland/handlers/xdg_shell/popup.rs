@@ -100,7 +100,7 @@ impl Shell {
     }
 
     /// Handle popup positioning for embedded windows.
-    /// When a window is embedded in another (e.g., okular embedded in chat-ui),
+    /// When a window is embedded in another.
     /// popups need to be positioned relative to where the embedded window is actually
     /// rendered, not where it would be in the workspace.
     fn unconstrain_popup_for_embedded(

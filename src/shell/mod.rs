@@ -2772,9 +2772,23 @@ impl Shell {
 
                 // Find the parent element by its surface ID - check all outputs and workspaces
                 for output in self.outputs() {
+                    tracing::debug!(
+                        embedded_app_id = %window.app_id(),
+                        output = %output.name(),
+                        "Checking output for parent"
+                    );
+                    
                     // Check workspaces on this output
                     for workspace in self.workspaces.spaces().filter(|s| &s.output == output) {
                         for mapped in workspace.mapped() {
+                            let mapped_app_id = mapped.active_window().app_id();
+                            let mapped_surface_id = mapped.active_window().wl_surface().map(|s| s.id().to_string());
+                            tracing::debug!(
+                                checking_mapped_app_id = %mapped_app_id,
+                                checking_surface_id = ?mapped_surface_id,
+                                looking_for_surface_id = %embed_info.parent_surface_id,
+                                "Checking workspace mapped window"
+                            );
                             if let Some(surface) = mapped.active_window().wl_surface() {
                                 if surface.id().to_string() == embed_info.parent_surface_id {
                                     tracing::info!(
@@ -2792,6 +2806,14 @@ impl Shell {
                     // Check sticky layer on this output
                     if let Some(set) = self.workspaces.sets.get(output) {
                         for mapped in set.sticky_layer.mapped() {
+                            let mapped_app_id = mapped.active_window().app_id();
+                            let mapped_surface_id = mapped.active_window().wl_surface().map(|s| s.id().to_string());
+                            tracing::debug!(
+                                checking_mapped_app_id = %mapped_app_id,
+                                checking_surface_id = ?mapped_surface_id,
+                                looking_for_surface_id = %embed_info.parent_surface_id,
+                                "Checking sticky layer mapped window"
+                            );
                             if let Some(surface) = mapped.active_window().wl_surface() {
                                 if surface.id().to_string() == embed_info.parent_surface_id {
                                     tracing::info!(

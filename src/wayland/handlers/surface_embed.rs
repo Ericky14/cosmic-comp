@@ -143,6 +143,15 @@ pub fn is_parent_grabbed(parent_surface_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Check if a parent surface ID is a valid embed parent (has registered children in global registry)
+/// This is used to avoid orphaning embeds when the parent is on a different output
+pub fn is_valid_embed_parent(parent_surface_id: &str) -> bool {
+    EMBEDDED_APP_IDS
+        .read()
+        .map(|map| map.values().any(|info| info.parent_surface_id == parent_surface_id))
+        .unwrap_or(false)
+}
+
 /// State stored per-toplevel for embed rectangles (stored on WlSurface data_map)
 #[derive(Default, Debug)]
 pub struct EmbedToplevelState {
@@ -533,6 +542,10 @@ impl SurfaceEmbedHandler for State {
         // Send initial configure with toplevel's preferred size
         let geometry = toplevel.geometry();
         embed.configure(geometry.size.w, geometry.size.h);
+
+        // If the embedded window is already mapped on a different output than the parent,
+        // we need to move it to the parent's output.
+        self.move_embedded_to_parent_output(parent, toplevel);
     }
 
     fn embed_geometry_changed(
@@ -638,6 +651,86 @@ impl SurfaceEmbedHandler for State {
 }
 
 impl State {
+    /// Move an embedded window to the same output as its parent.
+    /// This is called when an embed relationship is created for an already-mapped window
+    /// that may be on a different output than its parent.
+    fn move_embedded_to_parent_output(&mut self, parent_surface: &WlSurface, embedded: &CosmicSurface) {
+        let parent_surface_id = parent_surface.id().to_string();
+        
+        info!(
+            "move_embedded_to_parent_output: checking if embedded '{}' needs to move to parent's output",
+            embedded.app_id()
+        );
+        
+        // Get the workspace handles for both parent and embedded
+        let (parent_handle, embedded_handle, embedded_mapped) = {
+            let shell = self.common.shell.read();
+            
+            // Find parent's workspace
+            let parent_mapped = shell.element_for_surface_id(&parent_surface_id);
+            let parent_workspace = parent_mapped.and_then(|m| shell.space_for(m));
+            let parent_handle = parent_workspace.map(|w| w.handle.clone());
+            
+            // Find embedded's workspace
+            let embedded_mapped = shell.element_for_surface(embedded).cloned();
+            let embedded_workspace = embedded_mapped.as_ref().and_then(|m| shell.space_for(m));
+            let embedded_handle = embedded_workspace.map(|w| w.handle.clone());
+            
+            if let (Some(p), Some(e)) = (&parent_handle, &embedded_handle) {
+                info!(
+                    "move_embedded_to_parent_output: parent workspace={:?}, embedded workspace={:?}",
+                    p, e
+                );
+            } else {
+                info!(
+                    "move_embedded_to_parent_output: could not find workspaces - parent={:?}, embedded={:?}",
+                    parent_handle.is_some(), embedded_handle.is_some()
+                );
+            }
+            
+            (parent_handle, embedded_handle, embedded_mapped)
+        };
+        
+        // If they're in different workspaces, move the embedded window
+        if let (Some(parent_handle), Some(embedded_handle), Some(embedded_mapped)) = 
+            (parent_handle, embedded_handle, embedded_mapped) 
+        {
+            if parent_handle != embedded_handle {
+                info!(
+                    "move_embedded_to_parent_output: moving embedded '{}' from {:?} to {:?}",
+                    embedded.app_id(),
+                    embedded_handle,
+                    parent_handle
+                );
+                
+                // Get workspace state for the move
+                let mut workspace_state = self.common.workspace_state.update();
+                let mut shell = self.common.shell.write();
+                
+                // Move the element
+                let _ = shell.move_element(
+                    None, // No seat - we don't want to follow with focus
+                    &embedded_mapped,
+                    &embedded_handle,
+                    &parent_handle,
+                    false, // Don't follow (don't change active workspace)
+                    None,  // No direction preference
+                    &mut workspace_state,
+                );
+                
+                info!(
+                    "move_embedded_to_parent_output: moved embedded '{}' to parent's workspace",
+                    embedded.app_id()
+                );
+            } else {
+                info!(
+                    "move_embedded_to_parent_output: embedded '{}' already on same workspace as parent",
+                    embedded.app_id()
+                );
+            }
+        }
+    }
+
     /// Find the CosmicSurface for a WlSurface by searching through all mapped windows
     fn find_window_for_surface(&self, surface: &WlSurface) -> Option<CosmicSurface> {
         let shell = self.common.shell.read();
