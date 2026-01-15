@@ -107,6 +107,18 @@ pub static EMBED_ANIMATION_SYNC: LazyLock<RwLock<HashMap<String, EmbedAnimationS
 pub static EMBEDDED_APP_IDS: LazyLock<RwLock<HashMap<String, EmbedRenderInfo>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Set of PIDs that have a pending embed request.
+/// Windows from these PIDs should be hidden until the embed is fulfilled.
+/// This prevents the "flash" of the window appearing before embedding.
+pub static PIDS_PENDING_EMBED: LazyLock<RwLock<std::collections::HashSet<u32>>> =
+    LazyLock::new(|| RwLock::new(std::collections::HashSet::new()));
+
+/// Set of surface IDs (WlSurface ObjectId as string) that are pending embed.
+/// These specific surfaces should be hidden until the embed is fulfilled.
+/// This is more precise than app_id - each surface ID is unique.
+pub static SURFACE_IDS_PENDING_EMBED: LazyLock<RwLock<std::collections::HashSet<String>>> =
+    LazyLock::new(|| RwLock::new(std::collections::HashSet::new()));
+
 /// Set of parent surface IDs that are currently being grabbed (move/resize).
 /// These should NOT be considered "orphaned" in cleanup_orphaned_embeds even if
 /// they're not in space.elements() (because they're in the grab state).
@@ -143,12 +155,69 @@ pub fn is_parent_grabbed(parent_surface_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Mark a PID as having a pending embed (window should be hidden until embedded)
+pub fn mark_pid_pending_embed(pid: u32) {
+    if let Ok(mut set) = PIDS_PENDING_EMBED.write() {
+        set.insert(pid);
+        tracing::info!(pid = pid, "Marked PID as pending embed (will hide until embedded)");
+    }
+}
+
+/// Remove a PID from the pending embed set (window can now be shown)
+pub fn unmark_pid_pending_embed(pid: u32) {
+    if let Ok(mut set) = PIDS_PENDING_EMBED.write() {
+        if set.remove(&pid) {
+            tracing::info!(pid = pid, "Unmarked PID from pending embed (now visible)");
+        }
+    }
+}
+
+/// Check if a PID has a pending embed (should be hidden)
+pub fn is_pid_pending_embed(pid: u32) -> bool {
+    PIDS_PENDING_EMBED
+        .read()
+        .map(|set| set.contains(&pid))
+        .unwrap_or(false)
+}
+
+/// Mark a surface ID as having a pending embed (window should be hidden until embedded)
+/// This is called when we find a window matching a pending PID embed, before it renders.
+pub fn mark_surface_id_pending_embed(surface_id: &str) {
+    if surface_id.is_empty() {
+        return;
+    }
+    if let Ok(mut set) = SURFACE_IDS_PENDING_EMBED.write() {
+        set.insert(surface_id.to_string());
+        tracing::info!(surface_id = surface_id, "Marked surface as pending embed (will hide until embedded)");
+    }
+}
+
+/// Remove a surface ID from the pending embed set (window can now be shown)
+pub fn unmark_surface_id_pending_embed(surface_id: &str) {
+    if let Ok(mut set) = SURFACE_IDS_PENDING_EMBED.write() {
+        if set.remove(surface_id) {
+            tracing::info!(surface_id = surface_id, "Unmarked surface from pending embed (now visible)");
+        }
+    }
+}
+
+/// Check if a surface ID has a pending embed (should be hidden)
+pub fn is_surface_id_pending_embed(surface_id: &str) -> bool {
+    SURFACE_IDS_PENDING_EMBED
+        .read()
+        .map(|set| set.contains(surface_id))
+        .unwrap_or(false)
+}
+
 /// Check if a parent surface ID is a valid embed parent (has registered children in global registry)
 /// This is used to avoid orphaning embeds when the parent is on a different output
 pub fn is_valid_embed_parent(parent_surface_id: &str) -> bool {
     EMBEDDED_APP_IDS
         .read()
-        .map(|map| map.values().any(|info| info.parent_surface_id == parent_surface_id))
+        .map(|map| {
+            map.values()
+                .any(|info| info.parent_surface_id == parent_surface_id)
+        })
         .unwrap_or(false)
 }
 
@@ -236,6 +305,10 @@ pub fn mark_surface_embedded(
         corner_radius[3], // bl
         corner_radius[0], // tl
     ];
+
+    // Surface is now fully embedded - unmark from pending embed set
+    // This allows the surface to be rendered (as an embedded child of parent)
+    unmark_surface_id_pending_embed(surface_id);
 
     if let Ok(mut map) = EMBEDDED_APP_IDS.write() {
         map.insert(
@@ -517,9 +590,18 @@ impl SurfaceEmbedHandler for State {
     fn register_pending_pid_embed(
         &mut self,
         pid: u32,
+        expected_app_id: Option<&str>,
         embed: zcosmic_embedded_surface_v1::ZcosmicEmbeddedSurfaceV1,
     ) {
-        info!("Registering pending PID embed for PID {}", pid);
+        info!(
+            "Registering pending PID embed for PID {}, app_id hint: {:?}",
+            pid, expected_app_id
+        );
+        // Mark this PID as pending embed - we'll mark the specific surface ID when window maps
+        mark_pid_pending_embed(pid);
+        // Note: We don't mark by app_id because multiple windows could have same app_id.
+        // Instead, when check_pending_pid_embeds_for_window finds a matching window,
+        // we mark that specific surface ID as pending.
         self.common
             .pending_pid_embeds
             .entry(pid)
@@ -654,28 +736,32 @@ impl State {
     /// Move an embedded window to the same output as its parent.
     /// This is called when an embed relationship is created for an already-mapped window
     /// that may be on a different output than its parent.
-    fn move_embedded_to_parent_output(&mut self, parent_surface: &WlSurface, embedded: &CosmicSurface) {
+    fn move_embedded_to_parent_output(
+        &mut self,
+        parent_surface: &WlSurface,
+        embedded: &CosmicSurface,
+    ) {
         let parent_surface_id = parent_surface.id().to_string();
-        
+
         info!(
             "move_embedded_to_parent_output: checking if embedded '{}' needs to move to parent's output",
             embedded.app_id()
         );
-        
+
         // Get the workspace handles for both parent and embedded
         let (parent_handle, embedded_handle, embedded_mapped) = {
             let shell = self.common.shell.read();
-            
+
             // Find parent's workspace
             let parent_mapped = shell.element_for_surface_id(&parent_surface_id);
             let parent_workspace = parent_mapped.and_then(|m| shell.space_for(m));
             let parent_handle = parent_workspace.map(|w| w.handle.clone());
-            
+
             // Find embedded's workspace
             let embedded_mapped = shell.element_for_surface(embedded).cloned();
             let embedded_workspace = embedded_mapped.as_ref().and_then(|m| shell.space_for(m));
             let embedded_handle = embedded_workspace.map(|w| w.handle.clone());
-            
+
             if let (Some(p), Some(e)) = (&parent_handle, &embedded_handle) {
                 info!(
                     "move_embedded_to_parent_output: parent workspace={:?}, embedded workspace={:?}",
@@ -684,16 +770,17 @@ impl State {
             } else {
                 info!(
                     "move_embedded_to_parent_output: could not find workspaces - parent={:?}, embedded={:?}",
-                    parent_handle.is_some(), embedded_handle.is_some()
+                    parent_handle.is_some(),
+                    embedded_handle.is_some()
                 );
             }
-            
+
             (parent_handle, embedded_handle, embedded_mapped)
         };
-        
+
         // If they're in different workspaces, move the embedded window
-        if let (Some(parent_handle), Some(embedded_handle), Some(embedded_mapped)) = 
-            (parent_handle, embedded_handle, embedded_mapped) 
+        if let (Some(parent_handle), Some(embedded_handle), Some(embedded_mapped)) =
+            (parent_handle, embedded_handle, embedded_mapped)
         {
             if parent_handle != embedded_handle {
                 info!(
@@ -702,11 +789,11 @@ impl State {
                     embedded_handle,
                     parent_handle
                 );
-                
+
                 // Get workspace state for the move
                 let mut workspace_state = self.common.workspace_state.update();
                 let mut shell = self.common.shell.write();
-                
+
                 // Move the element
                 let _ = shell.move_element(
                     None, // No seat - we don't want to follow with focus
@@ -717,7 +804,7 @@ impl State {
                     None,  // No direction preference
                     &mut workspace_state,
                 );
-                
+
                 info!(
                     "move_embedded_to_parent_output: moved embedded '{}' to parent's workspace",
                     embedded.app_id()
@@ -766,6 +853,8 @@ impl State {
             None => return,
         };
 
+        let surface_id = wl_surface.id().to_string();
+
         let client = match self.common.display_handle.get_client(wl_surface.id()) {
             Ok(c) => c,
             Err(_) => return,
@@ -780,12 +869,19 @@ impl State {
 
         // Check if there are any pending embeds for this PID
         if let Some(pending_embeds) = self.common.pending_pid_embeds.remove(&pid) {
+            // IMMEDIATELY mark this specific surface as pending embed to hide it
+            // This prevents any render frames showing the window before embed is fulfilled
+            mark_surface_id_pending_embed(&surface_id);
+            
+            // Unmark PID from pending (we found the window)
+            unmark_pid_pending_embed(pid);
             let app_id = window.app_id();
             info!(
-                "Fulfilling {} pending embed(s) for PID {} (app_id: {})",
+                "Fulfilling {} pending embed(s) for PID {} (app_id: {}, surface: {})",
                 pending_embeds.len(),
                 pid,
-                app_id
+                app_id,
+                surface_id
             );
 
             for embed in pending_embeds {

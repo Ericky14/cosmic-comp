@@ -2875,6 +2875,26 @@ impl FloatingLayout {
                 continue;
             }
 
+            // Check if this specific surface has a pending embed (hide until embedded)
+            // This prevents the "flash" of window appearing before embed is fulfilled
+            // We use surface_id (unique per window) instead of app_id to avoid hiding
+            // multiple windows of the same app (only the one being embedded should hide)
+            if let Some(surface_id) = elem
+                .active_window()
+                .wl_surface()
+                .map(|s| s.id().to_string())
+            {
+                if crate::wayland::handlers::surface_embed::is_surface_id_pending_embed(&surface_id)
+                {
+                    tracing::debug!(
+                        app_id = %elem.active_window().app_id(),
+                        surface_id = %surface_id,
+                        "Hiding window - pending embed for this surface"
+                    );
+                    continue;
+                }
+            }
+
             // Convert front-to-back index to back-to-front z-index
             // Index 0 in iteration = topmost window = z-index (total-1)
             // Index (total-1) in iteration = bottom window = z-index 0

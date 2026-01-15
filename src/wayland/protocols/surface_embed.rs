@@ -400,9 +400,10 @@ pub trait SurfaceEmbedHandler: Sized {
     fn register_pending_pid_embed(
         &mut self,
         pid: u32,
+        expected_app_id: Option<&str>,
         embed: zcosmic_embedded_surface_v1::ZcosmicEmbeddedSurfaceV1,
     ) {
-        let _ = (pid, embed);
+        let _ = (pid, expected_app_id, embed);
     }
 
     /// Called when an embed is created
@@ -594,7 +595,12 @@ where
                     });
 
                     // Register for later fulfillment
-                    state.register_pending_pid_embed(pid, embed);
+                    let expected_app_id_ref = if app_id.is_empty() {
+                        None
+                    } else {
+                        Some(app_id.as_str())
+                    };
+                    state.register_pending_pid_embed(pid, expected_app_id_ref, embed);
                 }
             }
         }
