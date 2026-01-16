@@ -10,7 +10,10 @@ use smithay::wayland::shell::xdg::SurfaceCachedState;
 use smithay::{
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel,
-        wayland_server::{Client, Dispatch, DisplayHandle, GlobalDispatch, Resource, Weak},
+        wayland_server::{
+            Client, Dispatch, DisplayHandle, GlobalDispatch, Resource, Weak,
+            protocol::wl_surface::WlSurface,
+        },
     },
     wayland::shell::xdg::XdgShellHandler,
 };
@@ -360,3 +363,30 @@ macro_rules! delegate_corner_radius {
     };
 }
 pub(crate) use delegate_corner_radius;
+
+/// Get corner radius from any WlSurface that has CacheableCorners set.
+/// Returns corner radius as [top_left, top_right, bottom_right, bottom_left] in f32.
+/// Returns [0.0; 4] if no corner radius is set.
+pub fn get_surface_corner_radius(
+    surface: &WlSurface,
+    geometry_size: smithay::utils::Size<i32, smithay::utils::Logical>,
+) -> [f32; 4] {
+    with_states(surface, |states| {
+        let mut guard = states.cached_state.get::<CacheableCorners>();
+
+        // Guard against corner radius being too large
+        let half_min_dim =
+            u8::try_from(geometry_size.w.min(geometry_size.h) / 2).unwrap_or(u8::MAX);
+
+        if let Some(corners) = guard.current().0 {
+            [
+                corners.top_left.min(half_min_dim) as f32,
+                corners.top_right.min(half_min_dim) as f32,
+                corners.bottom_right.min(half_min_dim) as f32,
+                corners.bottom_left.min(half_min_dim) as f32,
+            ]
+        } else {
+            [0.0; 4]
+        }
+    })
+}

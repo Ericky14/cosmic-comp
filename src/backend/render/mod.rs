@@ -37,7 +37,11 @@ use crate::{
             data_device::get_dnd_icon,
             screencopy::{FrameHolder, SessionData, render_session},
         },
-        protocols::{blur::has_blur as surface_has_blur, workspace::WorkspaceHandle},
+        protocols::{
+            blur::has_blur as surface_has_blur,
+            corner_radius::get_surface_corner_radius,
+            workspace::WorkspaceHandle,
+        },
     },
 };
 
@@ -1266,6 +1270,10 @@ where
                         let local_geo =
                             Rectangle::new(location.to_local(output), layer_geo.size.as_local());
 
+                        // Get corner radius from the surface (same as windows)
+                        let corner_radius =
+                            get_surface_corner_radius(layer.wl_surface(), layer_geo.size);
+
                         // Try to get cached blur texture for this layer surface
                         if let Some(blur_info) =
                             get_cached_blur_texture_for_layer(&output_name, surface_id)
@@ -1280,7 +1288,7 @@ where
                                 blur_info.screen_size,
                                 blur_info.scale.x,
                                 output_transform,
-                                [0.0; 4],
+                                corner_radius,
                                 1.0,
                                 BLUR_TINT_COLOR,
                                 BLUR_TINT_STRENGTH,

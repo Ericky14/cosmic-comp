@@ -21,6 +21,7 @@ use crate::{
             corner_radius::CornerRadiusState,
             drm::WlDrmState,
             image_capture_source::ImageCaptureSourceState,
+            layer_corner_radius::LayerCornerRadiusState,
             output_configuration::OutputConfigurationState,
             output_power::OutputPowerState,
             overlap_notify::OverlapNotifyState,
@@ -254,6 +255,7 @@ pub struct Common {
     pub blur_state: BlurState,
     pub compositor_state: CompositorState,
     pub corner_radius_state: CornerRadiusState,
+    pub layer_corner_radius_state: LayerCornerRadiusState,
     pub data_device_state: DataDeviceState,
     pub dmabuf_state: DmabufState,
     pub fractional_scale_state: FractionalScaleManagerState,
@@ -645,6 +647,7 @@ impl State {
         let blur_state = BlurState::new::<Self>(dh);
         let compositor_state = CompositorState::new::<Self>(dh);
         let corner_radius_state = CornerRadiusState::new::<Self>(dh);
+        let layer_corner_radius_state = LayerCornerRadiusState::new::<Self>(dh);
         let data_device_state = DataDeviceState::new::<Self>(dh);
         let dmabuf_state = DmabufState::new();
         let fractional_scale_state = FractionalScaleManagerState::new::<State>(dh);
@@ -766,6 +769,7 @@ impl State {
                 blur_state,
                 compositor_state,
                 corner_radius_state,
+                layer_corner_radius_state,
                 data_device_state,
                 dmabuf_state,
                 fractional_scale_state,
