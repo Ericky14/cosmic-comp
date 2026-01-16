@@ -853,7 +853,8 @@ fn process_blur(
 
         // Throttle blur updates: if content changed but we have cached textures
         // and it's been less than BLUR_THROTTLE_INTERVAL, use the cache
-        let throttled = content_changed && all_cached 
+        let throttled = content_changed
+            && all_cached
             && should_throttle_blur(&output_name, group.capture_z_threshold);
 
         let can_reuse_cache = (!content_changed && all_cached) || throttled;
