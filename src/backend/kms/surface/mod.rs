@@ -10,8 +10,8 @@ use crate::{
         element::{CosmicElement, DamageElement},
         get_blur_group_content_hash, get_cached_blur_texture_for_layer,
         get_cached_blur_texture_for_window, get_layer_blur_content_hash, get_layer_blur_surfaces,
-        init_shaders, output_elements, store_blur_group_content_hash,
-        store_layer_blur_content_hash, workspace_elements,
+        init_shaders, output_elements, should_throttle_blur, store_blur_group_content_hash,
+        store_blur_group_last_update, store_layer_blur_content_hash, workspace_elements,
     },
     config::ScreenFilter,
     shell::{Shell, grabs::SeatMoveGrabState},
@@ -851,7 +851,12 @@ fn process_blur(
             get_cached_blur_texture_for_window(&output_name, window_key).is_some()
         });
 
-        let can_reuse_cache = !content_changed && all_cached;
+        // Throttle blur updates: if content changed but we have cached textures
+        // and it's been less than BLUR_THROTTLE_INTERVAL, use the cache
+        let throttled = content_changed && all_cached 
+            && should_throttle_blur(&output_name, group.capture_z_threshold);
+
+        let can_reuse_cache = (!content_changed && all_cached) || throttled;
 
         if can_reuse_cache {
             let group_elapsed = group_start.elapsed();
@@ -860,7 +865,8 @@ fn process_blur(
                 windows = group.windows.len(),
                 capture_us = capture_elapsed.as_micros(),
                 total_us = group_elapsed.as_micros(),
-                "Skipping blur - cache valid (content unchanged)"
+                throttled = throttled,
+                "Skipping blur - cache valid"
             );
             any_blur_applied = true;
             continue;
@@ -874,8 +880,9 @@ fn process_blur(
             "Re-blurring group"
         );
 
-        // Store the new content hash after we commit to re-blurring
+        // Store the new content hash and timestamp after we commit to re-blurring
         store_blur_group_content_hash(&output_name, group.capture_z_threshold, content_hash);
+        store_blur_group_last_update(&output_name, group.capture_z_threshold);
 
         // Render captured elements to background texture
         let bg_render_start = std::time::Instant::now();

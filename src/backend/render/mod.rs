@@ -137,15 +137,16 @@ pub static ACTIVE_GROUP_COLOR: [f32; 3] = [0.58, 0.922, 0.922];
 // Blur module re-exports
 pub use blur::{
     BLUR_DOWNSAMPLE_FACTOR, BLUR_FALLBACK_ALPHA, BLUR_FALLBACK_COLOR, BLUR_ITERATIONS,
-    BLUR_TINT_COLOR, BLUR_TINT_STRENGTH, BlurCaptureContext, BlurRenderState, BlurredTextureInfo,
-    CachedLayerSurface, DEFAULT_BLUR_RADIUS, HasBlur, LayerBlurSurfaceInfo, apply_blur_passes,
-    blur_downsample_enabled, cache_blur_texture_for_layer, cache_blur_texture_for_window,
-    clear_blur_textures_for_output, clear_cached_layer_surfaces,
+    BLUR_TINT_COLOR, BLUR_TINT_STRENGTH, BLUR_THROTTLE_INTERVAL, BlurCaptureContext, 
+    BlurRenderState, BlurredTextureInfo, CachedLayerSurface, DEFAULT_BLUR_RADIUS, HasBlur, 
+    LayerBlurSurfaceInfo, apply_blur_passes, blur_downsample_enabled, cache_blur_texture_for_layer, 
+    cache_blur_texture_for_window, clear_blur_textures_for_output, clear_cached_layer_surfaces,
     clear_layer_blur_textures_for_output, compute_element_content_hash, downsample_texture,
     get_blur_group_content_hash, get_cached_blur_texture_for_layer,
     get_cached_blur_texture_for_window, get_cached_layer_surfaces, get_layer_blur_content_hash,
     get_layer_blur_surfaces, output_has_layer_blur, set_cached_layer_surfaces,
-    set_layer_blur_surfaces, store_blur_group_content_hash, store_layer_blur_content_hash,
+    set_layer_blur_surfaces, should_throttle_blur, store_blur_group_content_hash, 
+    store_blur_group_last_update, store_layer_blur_content_hash,
 };
 
 /// Shader for applying blur effects to surfaces

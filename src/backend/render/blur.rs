@@ -43,6 +43,7 @@ use smithay::{
 };
 use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
+use std::time::{Duration, Instant};
 
 use super::element::AsGlowRenderer;
 use crate::shell::element::{CosmicMapped, CosmicMappedKey};
@@ -58,8 +59,6 @@ pub const DEFAULT_BLUR_RADIUS: f32 = 100.0;
 pub const BLUR_ITERATIONS: u32 = 12;
 
 /// Downsample factor for blur textures.
-/// For Figma blur 100, we need heavy downsampling:
-/// - Factor of 8 = 1/64 pixel count (1/8 in each dimension)
 /// This massively increases perceived blur and is very GPU-efficient.
 pub const BLUR_DOWNSAMPLE_FACTOR: i32 = 8;
 
@@ -71,6 +70,11 @@ pub const BLUR_TINT_STRENGTH: f32 = 0.10;
 pub const BLUR_FALLBACK_ALPHA: f32 = 0.25;
 /// Fallback color when blur texture not available (light gray-blue)
 pub const BLUR_FALLBACK_COLOR: [f32; 3] = [0.9, 0.9, 0.95];
+
+/// Minimum interval between blur updates when only content changes (e.g., cursor blink).
+/// This throttles blur re-computation to reduce GPU load from high-frequency updates.
+/// 100ms = 10 blur updates per second max when background is animating.
+pub const BLUR_THROTTLE_INTERVAL: Duration = Duration::from_millis(100);
 
 // =============================================================================
 // Environment Configuration
@@ -353,6 +357,11 @@ type BlurGroupContentKey = (String, usize);
 pub static BLUR_GROUP_CONTENT_STATE: LazyLock<RwLock<HashMap<BlurGroupContentKey, u64>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Tracks the last time blur was computed for each group.
+/// Used for throttling blur updates when content changes frequently.
+pub static BLUR_GROUP_LAST_UPDATE: LazyLock<RwLock<HashMap<BlurGroupContentKey, Instant>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
 /// Compute a hash for a window key (for cache lookup)
 fn window_key_hash(key: &CosmicMappedKey) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -633,6 +642,37 @@ pub fn store_blur_group_content_hash(output_name: &str, capture_z_threshold: usi
     let key = (output_name.to_string(), capture_z_threshold);
     if let Ok(mut cache) = BLUR_GROUP_CONTENT_STATE.write() {
         cache.insert(key, hash);
+    }
+}
+
+/// Get the last blur update time for a group
+pub fn get_blur_group_last_update(
+    output_name: &str,
+    capture_z_threshold: usize,
+) -> Option<Instant> {
+    let key = (output_name.to_string(), capture_z_threshold);
+    if let Ok(cache) = BLUR_GROUP_LAST_UPDATE.read() {
+        cache.get(&key).copied()
+    } else {
+        None
+    }
+}
+
+/// Store the last blur update time for a group
+pub fn store_blur_group_last_update(output_name: &str, capture_z_threshold: usize) {
+    let key = (output_name.to_string(), capture_z_threshold);
+    if let Ok(mut cache) = BLUR_GROUP_LAST_UPDATE.write() {
+        cache.insert(key, Instant::now());
+    }
+}
+
+/// Check if blur should be throttled (content changed but update was too recent).
+/// Returns true if we should skip re-blurring this frame.
+pub fn should_throttle_blur(output_name: &str, capture_z_threshold: usize) -> bool {
+    if let Some(last_update) = get_blur_group_last_update(output_name, capture_z_threshold) {
+        last_update.elapsed() < BLUR_THROTTLE_INTERVAL
+    } else {
+        false
     }
 }
 
