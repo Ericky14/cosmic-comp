@@ -545,7 +545,7 @@ impl State {
                     let serial = SERIAL_COUNTER.next_serial();
                     ptr.motion(
                         self,
-                        under,
+                        new_under.clone(),
                         &MotionEvent {
                             location: position.as_logical(),
                             serial,
