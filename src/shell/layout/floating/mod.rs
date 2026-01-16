@@ -1545,7 +1545,10 @@ impl FloatingLayout {
     ) -> Option<KeyboardFocusTarget> {
         // First check embedded windows - they render on top and should get keyboard focus priority
         if let Some((elem, render_location)) = self.embedded_element_under(location) {
-            let render_location_local = render_location.as_local().to_f64();
+            // Subtract geometry offset to get the coordinate origin for focus_under,
+            // same as we do for non-embedded windows
+            let adjusted_render_location = render_location - elem.geometry().loc;
+            let render_location_local = adjusted_render_location.as_local().to_f64();
             let point = location - render_location_local;
             if elem
                 .focus_under(
@@ -1667,7 +1670,11 @@ impl FloatingLayout {
                     embed_info.geometry.loc.y,
                 ));
                 let render_location = parent_geometry.loc + embed_offset;
-                let render_location_f64 = render_location.to_f64();
+                // Subtract geometry offset to get the coordinate origin for focus_under,
+                // same as we do for non-embedded windows
+                let adjusted_render_location =
+                    render_location - embedded_elem.geometry().loc.as_local();
+                let render_location_f64 = adjusted_render_location.to_f64();
 
                 // Check if the location hits any popup of this embedded window
                 let point = location - render_location_f64;
@@ -1690,7 +1697,10 @@ impl FloatingLayout {
     ) -> Option<(PointerFocusTarget, Point<f64, Local>)> {
         // First check embedded windows - they render on top and should get priority
         if let Some((elem, render_location)) = self.embedded_element_under(location) {
-            let render_location_local = render_location.as_local().to_f64();
+            // Subtract geometry offset to get the coordinate origin for focus_under,
+            // same as we do for non-embedded windows
+            let adjusted_render_location = render_location - elem.geometry().loc;
+            let render_location_local = adjusted_render_location.as_local().to_f64();
             let point = location - render_location_local;
             if let Some((surface, surface_offset)) = elem.focus_under(
                 point.as_logical(),
