@@ -21,7 +21,7 @@ use smithay::{
     input::Seat,
     output::Output,
     reexports::wayland_server::Resource,
-    utils::{IsAlive, Logical, Point, Rectangle, Scale, Size},
+    utils::{IsAlive, Logical, Physical, Point, Rectangle, Scale, Size},
     wayland::seat::WaylandFocus,
 };
 
@@ -2990,14 +2990,22 @@ impl FloatingLayout {
                 ),
             );
 
-            if let Some(anim) = anim_opt {
-                // For client-driven resize, DON'T rescale the buffer - the client
-                // renders at the animated size and we use the buffer directly.
-                // Only compositor-driven animations (Tiled, Minimize, Unminimize)
-                // need buffer rescaling.
-                if !anim.is_client_driven() {
+            // Track animation info for later use (blur needs to be added before rescaling for minimize)
+            // Tuple: (original_geo, scale, relocation, buffer_size)
+            let minimize_anim_info: Option<(
+                Rectangle<i32, Local>,
+                Scale<f64>,
+                Point<i32, Physical>,
+                Size<i32, Local>,
+            )> = if let Some(anim) = anim_opt {
+                if !anim.is_client_driven()
+                    && matches!(
+                        anim,
+                        Animation::Minimize { .. } | Animation::Unminimize { .. }
+                    )
+                {
                     let original_geo = anim.previous_geometry();
-                    geometry = anim.geometry(
+                    let target_geometry = anim.geometry(
                         output_geometry,
                         self.space
                             .element_geometry(elem)
@@ -3007,71 +3015,93 @@ impl FloatingLayout {
                         self.gaps(),
                     );
 
-                    let buffer_size = elem.geometry().size;
+                    let buffer_size = elem.geometry().size.as_local();
+
+                    // Use uniform scaling to maintain aspect ratio
+                    let scale_x = target_geometry.size.w as f64 / buffer_size.w as f64;
+                    let scale_y = target_geometry.size.h as f64 / buffer_size.h as f64;
+                    let uniform_scale = scale_x.min(scale_y);
+
+                    // Calculate centering offset
+                    let scaled_w = (buffer_size.w as f64 * uniform_scale) as i32;
+                    let scaled_h = (buffer_size.h as f64 * uniform_scale) as i32;
+                    let offset_x = (target_geometry.size.w - scaled_w) / 2;
+                    let offset_y = (target_geometry.size.h - scaled_h) / 2;
+
                     let scale = Scale {
-                        x: geometry.size.w as f64 / buffer_size.w as f64,
-                        y: geometry.size.h as f64 / buffer_size.h as f64,
+                        x: uniform_scale,
+                        y: uniform_scale,
                     };
+                    let relocation = (target_geometry.loc - original_geo.loc
+                        + Point::from((offset_x, offset_y)).as_local())
+                    .as_logical()
+                    .to_physical_precise_round(output_scale);
 
-                    window_elements = window_elements
-                        .into_iter()
-                        .map(|element| match element {
-                            CosmicMappedRenderElement::Stack(elem) => {
-                                CosmicMappedRenderElement::MovingStack({
-                                    let rescaled = RescaleRenderElement::from_element(
-                                        elem,
-                                        original_geo
-                                            .loc
-                                            .as_logical()
-                                            .to_physical_precise_round(output_scale),
-                                        scale,
-                                    );
-
-                                    RelocateRenderElement::from_element(
-                                        rescaled,
-                                        (geometry.loc - original_geo.loc)
-                                            .as_logical()
-                                            .to_physical_precise_round(output_scale),
-                                        Relocate::Relative,
-                                    )
-                                })
-                            }
-                            CosmicMappedRenderElement::Window(elem) => {
-                                CosmicMappedRenderElement::MovingWindow({
-                                    let rescaled = RescaleRenderElement::from_element(
-                                        elem,
-                                        original_geo
-                                            .loc
-                                            .as_logical()
-                                            .to_physical_precise_round(output_scale),
-                                        scale,
-                                    );
-
-                                    RelocateRenderElement::from_element(
-                                        rescaled,
-                                        (geometry.loc - original_geo.loc)
-                                            .as_logical()
-                                            .to_physical_precise_round(output_scale),
-                                        Relocate::Relative,
-                                    )
-                                })
-                            }
-                            x => x,
-                        })
-                        .collect();
+                    Some((*original_geo, scale, relocation, buffer_size))
                 } else {
-                    // Client-driven: The geometry was already set correctly above
-                    // using client_driven_geometry(). No buffer rescaling or relocation
-                    // needed - the client renders at the animated size and we already
-                    // positioned it at the animated location.
+                    None
                 }
-            }
+            } else {
+                None
+            };
 
             // Add blur backdrop for windows that request KDE blur (independent of focus state)
             // Design spec: background: rgba(255, 255, 255, 0.10), backdrop-filter: blur(50px)
             // Skip adding backdrop if we're capturing background for blur
             if elem.has_blur() && blur_ctx.is_none() {
-                let corner_radius = elem.blur_corner_radius(geometry.size.as_logical());
+                // For minimize/unminimize animation, calculate the scaled blur geometry
+                // Use buffer_size (actual window size) not original_geo (which could be minimized size for unminimize)
+                let blur_geometry = if let Some((_original_geo, scale, _relocation, buffer_size)) =
+                    &minimize_anim_info
+                {
+                    // Calculate the animated size for blur based on buffer size and scale
+                    let scaled_w = (buffer_size.w as f64 * scale.x) as i32;
+                    let scaled_h = (buffer_size.h as f64 * scale.y) as i32;
+
+                    // Get the target geometry from the animation (this is the interpolated position/size)
+                    if let Some(anim) = anim_opt {
+                        let anim_geometry = anim.geometry(
+                            output_geometry,
+                            self.space
+                                .element_geometry(elem)
+                                .map(RectExt::as_local)
+                                .unwrap_or(geometry),
+                            elem.floating_tiled.lock().unwrap().as_ref(),
+                            self.gaps(),
+                        );
+
+                        tracing::debug!(
+                            buffer_w = buffer_size.w,
+                            buffer_h = buffer_size.h,
+                            scale_x = scale.x,
+                            scale_y = scale.y,
+                            scaled_w = scaled_w,
+                            scaled_h = scaled_h,
+                            anim_geo_x = anim_geometry.loc.x,
+                            anim_geo_y = anim_geometry.loc.y,
+                            anim_geo_w = anim_geometry.size.w,
+                            anim_geo_h = anim_geometry.size.h,
+                            "Minimize/unminimize blur geometry calculation"
+                        );
+
+                        // Center the scaled blur within the animation geometry
+                        let offset_x = (anim_geometry.size.w - scaled_w) / 2;
+                        let offset_y = (anim_geometry.size.h - scaled_h) / 2;
+                        Rectangle::new(
+                            Point::from((
+                                anim_geometry.loc.x + offset_x,
+                                anim_geometry.loc.y + offset_y,
+                            )),
+                            Size::from((scaled_w, scaled_h)),
+                        )
+                    } else {
+                        geometry
+                    }
+                } else {
+                    geometry
+                };
+
+                let corner_radius = elem.blur_corner_radius(blur_geometry.size.as_logical());
 
                 // Get the output name for looking up cached blur texture
                 let output_name = output.name();
@@ -3087,7 +3117,7 @@ impl FloatingLayout {
                     let blur_backdrop = BlurredBackdropShader::element(
                         renderer,
                         &blur_info.texture,
-                        geometry,
+                        blur_geometry,
                         blur_info.size,
                         blur_info.screen_size,
                         output_scale,
@@ -3108,13 +3138,136 @@ impl FloatingLayout {
                     let blur_backdrop = BackdropShader::element(
                         renderer,
                         Key::Window(Usage::Overlay, elem.key()),
-                        geometry,
+                        blur_geometry,
                         corner_radius,
                         alpha * BLUR_FALLBACK_ALPHA,
                         BLUR_FALLBACK_COLOR,
                     );
                     window_elements.push(blur_backdrop.into());
                 }
+            }
+
+            // Now apply animation transformations
+            if let Some(anim) = anim_opt {
+                if !anim.is_client_driven() {
+                    if let Some((original_geo, scale, relocation, _buffer_size)) =
+                        minimize_anim_info
+                    {
+                        // For minimize/unminimize: scale window elements with uniform scaling
+                        // Blur is already rendered at scaled geometry above
+                        window_elements = window_elements
+                            .into_iter()
+                            .map(|element| match element {
+                                CosmicMappedRenderElement::Stack(elem) => {
+                                    CosmicMappedRenderElement::MovingStack({
+                                        let rescaled = RescaleRenderElement::from_element(
+                                            elem,
+                                            original_geo
+                                                .loc
+                                                .as_logical()
+                                                .to_physical_precise_round(output_scale),
+                                            scale,
+                                        );
+
+                                        RelocateRenderElement::from_element(
+                                            rescaled,
+                                            relocation,
+                                            Relocate::Relative,
+                                        )
+                                    })
+                                }
+                                CosmicMappedRenderElement::Window(elem) => {
+                                    CosmicMappedRenderElement::MovingWindow({
+                                        let rescaled = RescaleRenderElement::from_element(
+                                            elem,
+                                            original_geo
+                                                .loc
+                                                .as_logical()
+                                                .to_physical_precise_round(output_scale),
+                                            scale,
+                                        );
+
+                                        RelocateRenderElement::from_element(
+                                            rescaled,
+                                            relocation,
+                                            Relocate::Relative,
+                                        )
+                                    })
+                                }
+                                x => x,
+                            })
+                            .collect();
+                    } else {
+                        // For other compositor-driven animations (like Tiled), use per-axis scaling
+                        let original_geo = anim.previous_geometry();
+                        geometry = anim.geometry(
+                            output_geometry,
+                            self.space
+                                .element_geometry(elem)
+                                .map(RectExt::as_local)
+                                .unwrap_or(geometry),
+                            elem.floating_tiled.lock().unwrap().as_ref(),
+                            self.gaps(),
+                        );
+
+                        let buffer_size = elem.geometry().size;
+                        let scale = Scale {
+                            x: geometry.size.w as f64 / buffer_size.w as f64,
+                            y: geometry.size.h as f64 / buffer_size.h as f64,
+                        };
+
+                        let relocation = (geometry.loc - original_geo.loc)
+                            .as_logical()
+                            .to_physical_precise_round(output_scale);
+
+                        window_elements = window_elements
+                            .into_iter()
+                            .map(|element| match element {
+                                CosmicMappedRenderElement::Stack(elem) => {
+                                    CosmicMappedRenderElement::MovingStack({
+                                        let rescaled = RescaleRenderElement::from_element(
+                                            elem,
+                                            original_geo
+                                                .loc
+                                                .as_logical()
+                                                .to_physical_precise_round(output_scale),
+                                            scale,
+                                        );
+
+                                        RelocateRenderElement::from_element(
+                                            rescaled,
+                                            relocation,
+                                            Relocate::Relative,
+                                        )
+                                    })
+                                }
+                                CosmicMappedRenderElement::Window(elem) => {
+                                    CosmicMappedRenderElement::MovingWindow({
+                                        let rescaled = RescaleRenderElement::from_element(
+                                            elem,
+                                            original_geo
+                                                .loc
+                                                .as_logical()
+                                                .to_physical_precise_round(output_scale),
+                                            scale,
+                                        );
+
+                                        RelocateRenderElement::from_element(
+                                            rescaled,
+                                            relocation,
+                                            Relocate::Relative,
+                                        )
+                                    })
+                                }
+                                x => x,
+                            })
+                            .collect();
+                    }
+                }
+                // Client-driven: The geometry was already set correctly above
+                // using client_driven_geometry(). No buffer rescaling or relocation
+                // needed - the client renders at the animated size and we already
+                // positioned it at the animated location.
             }
 
             if focused == Some(elem) && !elem.is_maximized(false) {
