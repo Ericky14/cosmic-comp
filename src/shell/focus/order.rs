@@ -5,13 +5,14 @@ use keyframe::{ease, functions::EaseInOutCubic};
 use smithay::{
     desktop::{LayerSurface, PopupKind, PopupManager, layer_map_for_output},
     output::{Output, OutputNoMode},
+    reexports::wayland_server::Resource,
     utils::{Logical, Point},
     wayland::{session_lock::LockSurface, shell::wlr_layer::Layer},
     xwayland::X11Surface,
 };
 
 use crate::{
-    backend::render::ElementFilter,
+    backend::render::{ElementFilter, HomeVisibilityContext},
     shell::{
         SeatExt, Shell, Workspace, WorkspaceDelta,
         focus::target::KeyboardFocusTarget,
@@ -62,6 +63,8 @@ pub enum Stage<'a> {
     LayerSurface {
         layer: LayerSurface,
         location: Point<i32, Global>,
+        /// Alpha/opacity for the surface (0.0-1.0), used for home visibility animation
+        alpha: f32,
     },
     OverrideRedirect {
         surface: &'a X11Surface,
@@ -100,6 +103,9 @@ fn render_input_order_internal<R: 'static>(
     element_filter: &ElementFilter,
     mut callback: impl FnMut(Stage) -> ControlFlow<Result<R, OutputNoMode>, ()>,
 ) -> ControlFlow<Result<R, OutputNoMode>, ()> {
+    // Create home visibility context once for all layer surface filtering
+    let home_visibility = HomeVisibilityContext::from_shell(shell);
+
     if shell
         .zoom_state
         .as_ref()
@@ -115,15 +121,23 @@ fn render_input_order_internal<R: 'static>(
 
     // Overlay-level layer shell
     // overlay is above everything
-    for (layer, popup, location) in layer_popups(output, Layer::Overlay, element_filter) {
+    for (layer, popup, location, _alpha) in
+        layer_popups(output, Layer::Overlay, element_filter, &home_visibility)
+    {
         callback(Stage::LayerPopup {
             layer,
             popup: &popup,
             location,
         })?;
     }
-    for (layer, location) in layer_surfaces(output, Layer::Overlay, element_filter) {
-        callback(Stage::LayerSurface { layer, location })?;
+    for (layer, location, alpha) in
+        layer_surfaces(output, Layer::Overlay, element_filter, &home_visibility)
+    {
+        callback(Stage::LayerSurface {
+            layer,
+            location,
+            alpha,
+        })?;
     }
 
     // calculate a bunch of stuff for workspace transitions
@@ -226,7 +240,9 @@ fn render_input_order_internal<R: 'static>(
 
     // Top-level layer shell popups
     if !has_focused_fullscreen {
-        for (layer, popup, location) in layer_popups(output, Layer::Top, element_filter) {
+        for (layer, popup, location, _alpha) in
+            layer_popups(output, Layer::Top, element_filter, &home_visibility)
+        {
             callback(Stage::LayerPopup {
                 layer,
                 popup: &popup,
@@ -287,7 +303,9 @@ fn render_input_order_internal<R: 'static>(
 
     if !has_focused_fullscreen {
         // bottom layer popups
-        for (layer, popup, location) in layer_popups(output, Layer::Bottom, element_filter) {
+        for (layer, popup, location, _alpha) in
+            layer_popups(output, Layer::Bottom, element_filter, &home_visibility)
+        {
             callback(Stage::LayerPopup {
                 layer,
                 popup: &popup,
@@ -299,7 +317,9 @@ fn render_input_order_internal<R: 'static>(
     if let Some((_, has_fullscreen, offset)) = previous.as_ref() {
         if !has_fullscreen {
             // previous bottom layer popups
-            for (layer, popup, location) in layer_popups(output, Layer::Bottom, element_filter) {
+            for (layer, popup, location, _alpha) in
+                layer_popups(output, Layer::Bottom, element_filter, &home_visibility)
+            {
                 callback(Stage::LayerPopup {
                     layer,
                     popup: &popup,
@@ -311,7 +331,9 @@ fn render_input_order_internal<R: 'static>(
 
     if !has_fullscreen {
         // background layer popups
-        for (layer, popup, location) in layer_popups(output, Layer::Background, element_filter) {
+        for (layer, popup, location, _alpha) in
+            layer_popups(output, Layer::Background, element_filter, &home_visibility)
+        {
             callback(Stage::LayerPopup {
                 layer,
                 popup: &popup,
@@ -323,7 +345,8 @@ fn render_input_order_internal<R: 'static>(
     if let Some((_, has_fullscreen, offset)) = previous.as_ref() {
         if !has_fullscreen {
             // previous background layer popups
-            for (layer, popup, location) in layer_popups(output, Layer::Background, element_filter)
+            for (layer, popup, location, _alpha) in
+                layer_popups(output, Layer::Background, element_filter, &home_visibility)
             {
                 callback(Stage::LayerPopup {
                     layer,
@@ -336,8 +359,14 @@ fn render_input_order_internal<R: 'static>(
 
     if !has_focused_fullscreen {
         // top-layer shell
-        for (layer, location) in layer_surfaces(output, Layer::Top, element_filter) {
-            callback(Stage::LayerSurface { layer, location })?;
+        for (layer, location, alpha) in
+            layer_surfaces(output, Layer::Top, element_filter, &home_visibility)
+        {
+            callback(Stage::LayerSurface {
+                layer,
+                location,
+                alpha,
+            })?;
         }
 
         // sticky windows
@@ -367,36 +396,60 @@ fn render_input_order_internal<R: 'static>(
 
     if !has_focused_fullscreen {
         // bottom layer
-        for (layer, mut location) in layer_surfaces(output, Layer::Bottom, element_filter) {
+        for (layer, mut location, alpha) in
+            layer_surfaces(output, Layer::Bottom, element_filter, &home_visibility)
+        {
             location += current_offset.as_global();
-            callback(Stage::LayerSurface { layer, location })?;
+            callback(Stage::LayerSurface {
+                layer,
+                location,
+                alpha,
+            })?;
         }
     }
 
     if let Some((_, has_fullscreen, offset)) = previous.as_ref() {
         if !has_fullscreen {
             // previous bottom layer
-            for (layer, mut location) in layer_surfaces(output, Layer::Bottom, element_filter) {
+            for (layer, mut location, alpha) in
+                layer_surfaces(output, Layer::Bottom, element_filter, &home_visibility)
+            {
                 location += offset.as_global();
-                callback(Stage::LayerSurface { layer, location })?;
+                callback(Stage::LayerSurface {
+                    layer,
+                    location,
+                    alpha,
+                })?;
             }
         }
     }
 
     if !has_fullscreen {
         // background layer
-        for (layer, mut location) in layer_surfaces(output, Layer::Background, element_filter) {
+        for (layer, mut location, alpha) in
+            layer_surfaces(output, Layer::Background, element_filter, &home_visibility)
+        {
             location += current_offset.as_global();
-            callback(Stage::LayerSurface { layer, location })?;
+            callback(Stage::LayerSurface {
+                layer,
+                location,
+                alpha,
+            })?;
         }
     }
 
     if let Some((_, has_fullscreen, offset)) = previous.as_ref() {
         if !has_fullscreen {
             // previous background layer
-            for (layer, mut location) in layer_surfaces(output, Layer::Background, element_filter) {
+            for (layer, mut location, alpha) in
+                layer_surfaces(output, Layer::Background, element_filter, &home_visibility)
+            {
                 location += offset.as_global();
-                callback(Stage::LayerSurface { layer, location })?;
+                callback(Stage::LayerSurface {
+                    layer,
+                    location,
+                    alpha,
+                })?;
             }
         }
     }
@@ -408,15 +461,25 @@ fn layer_popups<'a>(
     output: &'a Output,
     layer: Layer,
     element_filter: &'a ElementFilter,
-) -> impl Iterator<Item = (LayerSurface, PopupKind, Point<i32, Global>)> + 'a {
-    layer_surfaces(output, layer, element_filter).flat_map(move |(surface, location)| {
-        let location_clone = location;
-        let surface_clone = surface.clone();
-        PopupManager::popups_for_surface(surface.wl_surface()).map(move |(popup, popup_offset)| {
-            let offset = (popup_offset - popup.geometry().loc).as_global();
-            (surface_clone.clone(), popup, (location_clone + offset))
-        })
-    })
+    home_visibility: &'a HomeVisibilityContext,
+) -> impl Iterator<Item = (LayerSurface, PopupKind, Point<i32, Global>, f32)> + 'a {
+    layer_surfaces(output, layer, element_filter, home_visibility).flat_map(
+        move |(surface, location, alpha)| {
+            let location_clone = location;
+            let surface_clone = surface.clone();
+            PopupManager::popups_for_surface(surface.wl_surface()).map(
+                move |(popup, popup_offset)| {
+                    let offset = (popup_offset - popup.geometry().loc).as_global();
+                    (
+                        surface_clone.clone(),
+                        popup,
+                        (location_clone + offset),
+                        alpha,
+                    )
+                },
+            )
+        },
+    )
 }
 
 /// Get the z-order level of a layer (higher = closer to viewer)
@@ -434,7 +497,8 @@ fn layer_surfaces<'a>(
     output: &'a Output,
     layer: Layer,
     element_filter: &'a ElementFilter,
-) -> impl Iterator<Item = (LayerSurface, Point<i32, Global>)> + 'a {
+    home_visibility: &'a HomeVisibilityContext,
+) -> impl Iterator<Item = (LayerSurface, Point<i32, Global>, f32)> + 'a {
     // For BlurCapture and LayerBlurCapture modes, use cached layer surfaces to prevent deadlocks
     let use_cache = matches!(
         element_filter,
@@ -469,11 +533,24 @@ fn layer_surfaces<'a>(
             .collect::<Vec<_>>()
     };
 
-    layers
-        .into_iter()
-        .filter(move |(s, _)| {
-            !(*element_filter == ElementFilter::ExcludeWorkspaceOverview
-                && s.namespace() == WORKSPACE_OVERVIEW_NAMESPACE)
-        })
-        .map(|(surface, loc)| (surface, loc.as_local().to_global(output)))
+    layers.into_iter().filter_map(move |(s, loc)| {
+        // Filter out workspace overview namespace
+        if *element_filter == ElementFilter::ExcludeWorkspaceOverview
+            && s.namespace() == WORKSPACE_OVERVIEW_NAMESPACE
+        {
+            return None;
+        }
+
+        // Get visibility and alpha for this surface using home visibility context
+        let surface_id = s.wl_surface().id().protocol_id();
+        let (visible, alpha) = home_visibility.surface_visibility(surface_id);
+
+        // Filter out completely invisible surfaces
+        if !visible {
+            return None;
+        }
+
+        // Use the surface-specific alpha (which considers home_alpha for home-only surfaces)
+        Some((s, loc.as_local().to_global(output), alpha))
+    })
 }

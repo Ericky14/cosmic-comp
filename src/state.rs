@@ -21,6 +21,7 @@ use crate::{
             corner_radius::CornerRadiusState,
             drm::WlDrmState,
             exclusive_mode::ExclusiveModeState,
+            home_visibility::HomeVisibilityState,
             image_capture_source::ImageCaptureSourceState,
             layer_corner_radius::LayerCornerRadiusState,
             layer_shadow::LayerShadowManagerState,
@@ -262,6 +263,7 @@ pub struct Common {
     pub data_device_state: DataDeviceState,
     pub dmabuf_state: DmabufState,
     pub exclusive_mode_state: ExclusiveModeState,
+    pub home_visibility_state: HomeVisibilityState,
     pub fractional_scale_state: FractionalScaleManagerState,
     pub keyboard_shortcuts_inhibit_state: KeyboardShortcutsInhibitState,
     pub output_state: OutputManagerState,
@@ -656,6 +658,7 @@ impl State {
         let data_device_state = DataDeviceState::new::<Self>(dh);
         let dmabuf_state = DmabufState::new();
         let exclusive_mode_state = ExclusiveModeState::new::<Self>(dh);
+        let home_visibility_state = HomeVisibilityState::new::<Self>(dh);
         let fractional_scale_state = FractionalScaleManagerState::new::<State>(dh);
         let keyboard_shortcuts_inhibit_state = KeyboardShortcutsInhibitState::new::<Self>(dh);
         let output_state = OutputManagerState::new_with_xdg_output::<Self>(dh);
@@ -780,6 +783,7 @@ impl State {
                 data_device_state,
                 dmabuf_state,
                 exclusive_mode_state,
+                home_visibility_state,
                 fractional_scale_state,
                 idle_notifier_state,
                 idle_inhibit_manager_state,

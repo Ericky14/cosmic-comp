@@ -933,6 +933,41 @@ where
 #[cfg(not(feature = "debug"))]
 pub type EguiState = ();
 
+/// Context for home visibility filtering in layer surfaces
+#[derive(Clone, PartialEq)]
+pub struct HomeVisibilityContext {
+    /// Set of surface IDs that are "home-only" (only visible when in home mode)
+    pub home_only_surfaces: std::collections::HashSet<u32>,
+    /// Current home alpha (0.0 = home hidden, 1.0 = home fully visible)
+    pub home_alpha: f32,
+}
+
+impl HomeVisibilityContext {
+    /// Create a new context from shell state
+    pub fn from_shell(shell: &crate::shell::Shell) -> Self {
+        Self {
+            home_only_surfaces: shell.home_only_surfaces().clone(),
+            home_alpha: shell.home_alpha(),
+        }
+    }
+
+    /// Get visibility and alpha for a surface based on home mode
+    /// Returns (visible, alpha) where visible indicates if surface should be rendered
+    pub fn surface_visibility(&self, surface_id: u32) -> (bool, f32) {
+        if self.home_only_surfaces.contains(&surface_id) {
+            // Home-only surface: visible only when home_alpha > 0
+            if self.home_alpha > 0.0 {
+                (true, self.home_alpha)
+            } else {
+                (false, 0.0)
+            }
+        } else {
+            // Always-visible surface: full opacity
+            (true, 1.0)
+        }
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub enum ElementFilter {
     All,
@@ -945,6 +980,16 @@ pub enum ElementFilter {
     /// Capture only elements below the specified layer (for layer shell blur)
     /// Background layer captures nothing, Bottom captures Background only, etc.
     LayerBlurCapture(smithay::wayland::shell::wlr_layer::Layer),
+}
+
+impl ElementFilter {
+    /// Get home visibility context if available
+    /// Returns None for filters that don't need home visibility (blur captures, etc.)
+    pub fn home_visibility(&self) -> Option<&HomeVisibilityContext> {
+        // Home visibility is handled separately - not stored in ElementFilter
+        // This is a placeholder for when we might embed it
+        None
+    }
 }
 
 pub fn output_elements<R>(
@@ -1261,7 +1306,11 @@ where
                         .map(Into::into),
                     );
                 }
-                Stage::LayerSurface { layer, location } => {
+                Stage::LayerSurface {
+                    layer,
+                    location,
+                    alpha,
+                } => {
                     // First render the layer surface content
                     elements.extend(
                         render_elements_from_surface_tree::<_, WorkspaceRenderElement<_>>(
@@ -1272,7 +1321,7 @@ where
                                 .as_logical()
                                 .to_physical_precise_round(scale),
                             Scale::from(scale),
-                            1.0,
+                            alpha,
                             FRAME_TIME_FILTER,
                         )
                         .into_iter()
@@ -1299,7 +1348,7 @@ where
                             surface_id,
                             local_geo,
                             shadow_radius,
-                            1.0,
+                            alpha,
                             scale,
                             is_dark,
                         );
@@ -1330,7 +1379,7 @@ where
                                 blur_info.scale.x,
                                 output_transform,
                                 corner_radius,
-                                1.0,
+                                alpha,
                                 BLUR_TINT_COLOR,
                                 BLUR_TINT_STRENGTH,
                                 true, // Enable border for layer shells

@@ -17,6 +17,7 @@ pub mod drm_syncobj;
 pub mod exclusive_mode;
 pub mod foreign_toplevel_list;
 pub mod fractional_scale;
+pub mod home_visibility;
 pub mod idle_inhibit;
 pub mod idle_notify;
 pub mod image_capture_source;

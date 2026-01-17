@@ -1093,7 +1093,22 @@ impl State {
 
             // Gets the configured command for a given system action.
             Action::System(system) => {
-                if let Some(command) = self.common.config.system_actions.get(&system) {
+                use crate::shell::home_enabled;
+                use shortcuts::action::System;
+
+                // If HOME_ENABLED is set and this is the Launcher action, toggle home mode instead
+                if home_enabled() && system == System::Launcher {
+                    let mut shell = self.common.shell.write();
+                    if shell.is_home() {
+                        shell.exit_home(seat, &self.common.event_loop_handle);
+                        drop(shell);
+                        self.common.home_visibility_state.set_home(false);
+                    } else {
+                        shell.enter_home();
+                        drop(shell);
+                        self.common.home_visibility_state.set_home(true);
+                    }
+                } else if let Some(command) = self.common.config.system_actions.get(&system) {
                     self.spawn_command(command.clone());
                 }
             }
