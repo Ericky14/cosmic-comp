@@ -39,7 +39,7 @@ use crate::{
         },
         protocols::{
             blur::has_blur as surface_has_blur, corner_radius::get_surface_corner_radius,
-            workspace::WorkspaceHandle,
+            layer_shadow::surface_has_shadow, workspace::WorkspaceHandle,
         },
     },
 };
@@ -1280,20 +1280,40 @@ where
                         .map(Into::into),
                     );
 
-                    // Then render blur backdrop behind the layer surface
-                    // (elements added later are rendered behind earlier elements)
+                    let surface_id = layer.wl_surface().id().protocol_id();
+                    let layer_geo = layer.bbox();
+                    let local_geo =
+                        Rectangle::new(location.to_local(output), layer_geo.size.as_local());
+
+                    // Get corner radius from the surface (same as windows)
+                    let corner_radius =
+                        get_surface_corner_radius(layer.wl_surface(), layer_geo.size);
+
+                    // Render shadow behind the layer surface if enabled
+                    if surface_has_shadow(layer.wl_surface()) {
+                        let is_dark = theme.cosmic().is_dark;
+                        let shadow_radius = corner_radius.map(|r| r.round() as u8);
+
+                        let shadow_element = ShadowShader::layer_element(
+                            renderer,
+                            surface_id,
+                            local_geo,
+                            shadow_radius,
+                            1.0,
+                            scale,
+                            is_dark,
+                        );
+
+                        let shadow: WorkspaceRenderElement<R> =
+                            Into::<CosmicMappedRenderElement<R>>::into(shadow_element).into();
+                        if let Some(cropped) = crop_to_output(shadow) {
+                            elements.push(cropped.into());
+                        }
+                    }
+
+                    // Then render blur backdrop behind the layer surface (and shadow)
                     if surface_has_blur(layer.wl_surface()) {
-                        let surface_id = layer.wl_surface().id().protocol_id();
                         let output_name = output.name();
-
-                        // Use the layer's geometry for the backdrop
-                        let layer_geo = layer.bbox();
-                        let local_geo =
-                            Rectangle::new(location.to_local(output), layer_geo.size.as_local());
-
-                        // Get corner radius from the surface (same as windows)
-                        let corner_radius =
-                            get_surface_corner_radius(layer.wl_surface(), layer_geo.size);
 
                         // Try to get cached blur texture for this layer surface
                         if let Some(blur_info) =

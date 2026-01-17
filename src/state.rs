@@ -23,6 +23,7 @@ use crate::{
             exclusive_mode::ExclusiveModeState,
             image_capture_source::ImageCaptureSourceState,
             layer_corner_radius::LayerCornerRadiusState,
+            layer_shadow::LayerShadowManagerState,
             output_configuration::OutputConfigurationState,
             output_power::OutputPowerState,
             overlap_notify::OverlapNotifyState,
@@ -257,6 +258,7 @@ pub struct Common {
     pub compositor_state: CompositorState,
     pub corner_radius_state: CornerRadiusState,
     pub layer_corner_radius_state: LayerCornerRadiusState,
+    pub layer_shadow_state: LayerShadowManagerState,
     pub data_device_state: DataDeviceState,
     pub dmabuf_state: DmabufState,
     pub exclusive_mode_state: ExclusiveModeState,
@@ -650,6 +652,7 @@ impl State {
         let compositor_state = CompositorState::new::<Self>(dh);
         let corner_radius_state = CornerRadiusState::new::<Self>(dh);
         let layer_corner_radius_state = LayerCornerRadiusState::new::<Self>(dh);
+        let layer_shadow_state = LayerShadowManagerState::new::<Self>(dh);
         let data_device_state = DataDeviceState::new::<Self>(dh);
         let dmabuf_state = DmabufState::new();
         let exclusive_mode_state = ExclusiveModeState::new::<Self>(dh);
@@ -773,6 +776,7 @@ impl State {
                 compositor_state,
                 corner_radius_state,
                 layer_corner_radius_state,
+                layer_shadow_state,
                 data_device_state,
                 dmabuf_state,
                 exclusive_mode_state,
