@@ -32,6 +32,51 @@ use smithay::{
 use std::sync::Mutex;
 use tracing::{debug, info, warn};
 
+/// Check if `child_pid` is a direct or indirect child of `parent_pid`
+/// by walking up the process tree via /proc/{pid}/stat
+pub fn is_child_of_pid(parent_pid: u32, child_pid: u32) -> bool {
+    if parent_pid == child_pid {
+        return true; // Same process
+    }
+
+    let mut current_pid = child_pid;
+    let mut visited = std::collections::HashSet::new();
+
+    // Walk up the process tree
+    while current_pid != 0 && current_pid != 1 {
+        if !visited.insert(current_pid) {
+            // Cycle detection - shouldn't happen but be safe
+            break;
+        }
+
+        // Read /proc/{pid}/stat to get parent PID
+        let stat_path = format!("/proc/{}/stat", current_pid);
+        let stat_content = match std::fs::read_to_string(&stat_path) {
+            Ok(content) => content,
+            Err(_) => break, // Process may have exited
+        };
+
+        // Parse the stat file - format: pid (comm) state ppid ...
+        // The comm field can contain spaces and parentheses, so find the last ')'
+        let ppid = if let Some(last_paren) = stat_content.rfind(')') {
+            let after_comm = &stat_content[last_paren + 1..];
+            let fields: Vec<&str> = after_comm.split_whitespace().collect();
+            // fields[0] is state, fields[1] is ppid
+            fields.get(1).and_then(|s| s.parse::<u32>().ok())
+        } else {
+            None
+        };
+
+        match ppid {
+            Some(ppid) if ppid == parent_pid => return true,
+            Some(ppid) => current_pid = ppid,
+            None => break,
+        }
+    }
+
+    false
+}
+
 /// Render mode for embedded surfaces
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EmbedRenderMode {
@@ -548,6 +593,41 @@ where
                     app_id,
                     parent.id()
                 );
+
+                // Security check: verify the target PID is a child of the embedder client's PID
+                let embedder_pid = _client
+                    .get_credentials(_dhandle)
+                    .ok()
+                    .map(|creds| creds.pid as u32);
+
+                if let Some(embedder_pid) = embedder_pid {
+                    if !is_child_of_pid(embedder_pid, pid) {
+                        warn!(
+                            "embed_toplevel_by_pid: DENIED - PID {} is not a child of embedder PID {}",
+                            pid, embedder_pid
+                        );
+                        // Create an inert object - not allowed to embed non-child processes
+                        let embedded_data = EmbeddedSurfaceData::<W>::new_inert(
+                            parent.downgrade(),
+                            format!("denied:pid:{}", pid),
+                        );
+                        data_init.init(id, Mutex::new(embedded_data));
+                        return;
+                    }
+                    info!(
+                        "embed_toplevel_by_pid: ALLOWED - PID {} is a child of embedder PID {}",
+                        pid, embedder_pid
+                    );
+                } else {
+                    warn!("embed_toplevel_by_pid: Could not get embedder client credentials");
+                    // Deny if we can't verify
+                    let embedded_data = EmbeddedSurfaceData::<W>::new_inert(
+                        parent.downgrade(),
+                        format!("denied:no-creds:{}", pid),
+                    );
+                    data_init.init(id, Mutex::new(embedded_data));
+                    return;
+                }
 
                 let expected_app_id = if app_id.is_empty() {
                     None
