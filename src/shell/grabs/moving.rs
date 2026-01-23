@@ -210,7 +210,10 @@ impl MoveGrabState {
         let blur_backdrop_element: Option<CosmicMappedRenderElement<R>> = if self.window.has_blur()
         {
             let window_geo = self.window.geometry();
-            let corner_radius = self.window.blur_corner_radius(window_geo.size.as_logical());
+            // Compute window corner radius from theme: radius_s + 4 for values >= 4
+            let radius_s = theme.radius_s()[0];
+            let window_radius = (if radius_s < 4.0 { radius_s } else { radius_s + 4.0 }).round() as u8;
+            let corner_radius = self.window.blur_corner_radius(window_geo.size.as_logical(), window_radius);
 
             let output_name = output.name();
             let window_key = self.window.key();

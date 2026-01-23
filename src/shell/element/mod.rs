@@ -78,9 +78,6 @@ use super::{
 };
 use cosmic_settings_config::shortcuts::action::{Direction, FocusDirection};
 
-/// Default corner radius for windows (in pixels)
-pub const DEFAULT_WINDOW_CORNER_RADIUS: u8 = 22;
-
 space_elements! {
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     CosmicMappedInternal;
@@ -929,11 +926,15 @@ impl CosmicMapped {
     /// Returns [0.0; 4] for maximized windows, otherwise converts and reorders
     /// from [bottom_right, top_right, bottom_left, top_left] to shader order
     /// [top_left, top_right, bottom_right, bottom_left].
-    pub fn blur_corner_radius(&self, geometry_size: Size<i32, Logical>) -> [f32; 4] {
+    pub fn blur_corner_radius(
+        &self,
+        geometry_size: Size<i32, Logical>,
+        default_radius: u8,
+    ) -> [f32; 4] {
         if self.is_maximized(false) {
             [0.0f32; 4]
         } else {
-            let radius = self.corner_radius(geometry_size, DEFAULT_WINDOW_CORNER_RADIUS);
+            let radius = self.corner_radius(geometry_size, default_radius);
             [
                 radius[3] as f32, // top_left
                 radius[1] as f32, // top_right

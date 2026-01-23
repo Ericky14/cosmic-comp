@@ -5373,8 +5373,10 @@ where
         .unwrap();
         let scale = swap_geo.size.to_f64() / origin.size.to_f64();
 
-        let radius = [crate::shell::element::DEFAULT_WINDOW_CORNER_RADIUS; 4]
-            .map(|val| (val as f64 * scale.x.min(scale.y)).round() as u8);
+        let radius = theme
+            .radius_s()
+            .map(|x| if x < 4.0 { x } else { x + 4.0 })
+            .map(|val| (val * scale.x.min(scale.y) as f32).round() as u8);
         swap_elements.push(CosmicMappedRenderElement::FocusIndicator(
             IndicatorShader::focus_element(
                 renderer,
@@ -5443,14 +5445,13 @@ where
                                 .is_none_or(|n| n != &node_id) =>
                         {
                             mapped
-                                .corner_radius(
-                                    geo.size.as_logical(),
-                                    crate::shell::element::DEFAULT_WINDOW_CORNER_RADIUS,
-                                )
+                                .corner_radius(geo.size.as_logical(), indicator_thickness)
                                 .map(|val| (val as f64 * scale.x.min(scale.y)).round() as u8)
                         }
-                        _ => [crate::shell::element::DEFAULT_WINDOW_CORNER_RADIUS; 4]
-                            .map(|val| (val as f64 * scale.x.min(scale.y)).round() as u8),
+                        _ => theme
+                            .radius_s()
+                            .map(|x| if x < 4.0 { x } else { x + 4.0 })
+                            .map(|val| (val * scale.x.min(scale.y) as f32).round() as u8),
                     };
 
                     if data.is_group() {
@@ -5664,10 +5665,7 @@ where
 
                 // Add blur backdrop for windows that request KDE blur
                 if mapped.has_blur() {
-                    let radius = mapped.corner_radius(
-                        geo.size.as_logical(),
-                        crate::shell::element::DEFAULT_WINDOW_CORNER_RADIUS,
-                    );
+                    let radius = mapped.corner_radius(geo.size.as_logical(), 8);
                     // Reorder from [bottom_right, top_right, bottom_left, top_left]
                     // to shader expected order: [top_left, top_right, bottom_right, bottom_left]
                     let corner_radius = [

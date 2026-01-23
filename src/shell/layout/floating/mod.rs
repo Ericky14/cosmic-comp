@@ -3155,7 +3155,16 @@ impl FloatingLayout {
                     geometry
                 };
 
-                let corner_radius = elem.blur_corner_radius(blur_geometry.size.as_logical());
+                // Compute window corner radius from theme: radius_s + 4 for values >= 4
+                let radius_s = theme.radius_s()[0];
+                let window_radius = (if radius_s < 4.0 {
+                    radius_s
+                } else {
+                    radius_s + 4.0
+                })
+                .round() as u8;
+                let corner_radius =
+                    elem.blur_corner_radius(blur_geometry.size.as_logical(), window_radius);
 
                 // Get the output name for looking up cached blur texture
                 let output_name = output.name();
