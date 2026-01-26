@@ -225,8 +225,24 @@ impl Shell {
         // Handle voice mode focus transitions
         {
             let output = seat.active_output();
+            // Check if focused surface has a registered voice mode receiver
+            let has_voice_receiver = focused_element
+                .as_ref()
+                .and_then(|elem| {
+                    elem.active_window().wl_surface().map(|surface| {
+                        state
+                            .common
+                            .voice_mode_state
+                            .has_receiver_for_surface(&surface)
+                    })
+                })
+                .unwrap_or(false);
             let mut shell = state.common.shell.write();
-            shell.handle_voice_mode_focus_change(focused_element.as_ref(), &output);
+            shell.handle_voice_mode_focus_change(
+                focused_element.as_ref(),
+                &output,
+                has_voice_receiver,
+            );
         }
 
         update_focus_state(seat, target, state, serial, update_cursor);

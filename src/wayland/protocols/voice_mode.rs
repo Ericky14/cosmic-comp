@@ -2,9 +2,9 @@
 
 //! Implementation of the COSMIC voice mode protocol (zcosmic_voice_mode_v1)
 //!
-//! This protocol allows clients to register as voice input receivers.
+//! This protocol allows clients to register surfaces (windows) as voice input receivers.
 //! The compositor has full control over the voice mode orb - clients receive
-//! start/stop/cancel events based on focus.
+//! start/stop/cancel events based on surface focus.
 
 pub use generated::{zcosmic_voice_mode_manager_v1, zcosmic_voice_mode_v1};
 
@@ -28,7 +28,7 @@ mod generated {
 
 use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, Weak,
-    backend::GlobalId,
+    backend::GlobalId, protocol::wl_surface::WlSurface,
 };
 use std::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -80,21 +80,21 @@ pub enum VoiceState {
     Recording,
 }
 
-/// User data for a voice mode receiver
+/// User data for a voice mode receiver (per-surface)
 pub struct VoiceModeReceiverData {
-    /// App ID for this receiver
-    pub app_id: String,
+    /// The surface this receiver is registered for
+    pub surface: WlSurface,
     /// Whether this is the default receiver
     pub is_default: bool,
 }
 
-/// A registered voice input receiver
+/// A registered voice input receiver (per-surface)
 #[derive(Debug, Clone)]
 pub struct VoiceReceiver {
     /// Weak reference to the protocol object
     pub resource: Weak<zcosmic_voice_mode_v1::ZcosmicVoiceModeV1>,
-    /// App ID
-    pub app_id: String,
+    /// Weak reference to the wl_surface
+    pub surface: Weak<WlSurface>,
     /// Whether this is the default receiver
     pub is_default: bool,
 }
@@ -102,14 +102,12 @@ pub struct VoiceReceiver {
 /// State for the voice mode manager protocol
 pub struct VoiceModeState {
     global: GlobalId,
-    /// Registered receivers
+    /// Registered receivers (one per surface)
     receivers: Mutex<Vec<VoiceReceiver>>,
     /// Current orb state
     current_orb_state: Mutex<OrbState>,
-    /// Currently active receiver (receiving events)
-    active_receiver_app_id: Mutex<Option<String>>,
-    /// Default receiver app ID from env var
-    default_receiver_app_id: Option<String>,
+    /// Currently active receiver surface
+    active_receiver_surface: Mutex<Option<Weak<WlSurface>>>,
 }
 
 impl std::fmt::Debug for VoiceModeState {
@@ -118,10 +116,9 @@ impl std::fmt::Debug for VoiceModeState {
             .field("receivers_count", &self.receivers.lock().unwrap().len())
             .field("current_orb_state", &self.current_orb_state.lock().unwrap())
             .field(
-                "active_receiver",
-                &self.active_receiver_app_id.lock().unwrap(),
+                "has_active_receiver",
+                &self.active_receiver_surface.lock().unwrap().is_some(),
             )
-            .field("default_receiver", &self.default_receiver_app_id)
             .finish()
     }
 }
@@ -139,18 +136,11 @@ impl VoiceModeState {
         let global = dh
             .create_global::<D, zcosmic_voice_mode_manager_v1::ZcosmicVoiceModeManagerV1, _>(1, ());
 
-        // Get default receiver from env var
-        let default_receiver_app_id = std::env::var("COSMIC_VOICE_DEFAULT_RECEIVER").ok();
-        if let Some(ref app_id) = default_receiver_app_id {
-            info!(app_id = %app_id, "Default voice receiver configured");
-        }
-
         VoiceModeState {
             global,
             receivers: Mutex::new(Vec::new()),
             current_orb_state: Mutex::new(OrbState::Hidden),
-            active_receiver_app_id: Mutex::new(None),
-            default_receiver_app_id,
+            active_receiver_surface: Mutex::new(None),
         }
     }
 
@@ -169,20 +159,13 @@ impl VoiceModeState {
         *self.current_orb_state.lock().unwrap()
     }
 
-    /// Get the default receiver app ID
-    pub fn default_receiver_app_id(&self) -> Option<&str> {
-        self.default_receiver_app_id.as_deref()
-    }
-
-    /// Get the currently active receiver app ID
-    pub fn active_receiver_app_id(&self) -> Option<String> {
-        self.active_receiver_app_id.lock().unwrap().clone()
-    }
-
-    /// Find a receiver by app_id
-    fn find_receiver(&self, app_id: &str) -> Option<VoiceReceiver> {
+    /// Find a receiver by surface
+    fn find_receiver_by_surface(&self, surface: &WlSurface) -> Option<VoiceReceiver> {
         let receivers = self.receivers.lock().unwrap();
-        receivers.iter().find(|r| r.app_id == app_id).cloned()
+        receivers
+            .iter()
+            .find(|r| r.surface.upgrade().map(|s| s == *surface).unwrap_or(false))
+            .cloned()
     }
 
     /// Find the default receiver
@@ -191,19 +174,24 @@ impl VoiceModeState {
         receivers.iter().find(|r| r.is_default).cloned()
     }
 
-    /// Send start event to a specific receiver
-    pub fn send_start(&self, app_id: &str, orb_state: OrbState) -> bool {
-        *self.current_orb_state.lock().unwrap() = orb_state;
-        *self.active_receiver_app_id.lock().unwrap() = Some(app_id.to_string());
+    /// Check if a surface has a registered receiver
+    pub fn has_receiver_for_surface(&self, surface: &WlSurface) -> bool {
+        self.find_receiver_by_surface(surface).is_some()
+    }
 
-        if let Some(receiver) = self.find_receiver(app_id) {
+    /// Send start event to a specific surface's receiver
+    pub fn send_start_to_surface(&self, surface: &WlSurface, orb_state: OrbState) -> bool {
+        *self.current_orb_state.lock().unwrap() = orb_state;
+
+        if let Some(receiver) = self.find_receiver_by_surface(surface) {
+            *self.active_receiver_surface.lock().unwrap() = Some(receiver.surface.clone());
             if let Ok(resource) = receiver.resource.upgrade() {
-                info!(app_id = %app_id, ?orb_state, "Sending voice start to receiver");
+                info!(?orb_state, "Sending voice start to surface receiver");
                 resource.start(orb_state.into());
                 return true;
             }
         }
-        warn!(app_id = %app_id, "No receiver found for app_id");
+        warn!("No receiver found for surface");
         false
     }
 
@@ -212,9 +200,9 @@ impl VoiceModeState {
         *self.current_orb_state.lock().unwrap() = orb_state;
 
         if let Some(receiver) = self.find_default_receiver() {
-            *self.active_receiver_app_id.lock().unwrap() = Some(receiver.app_id.clone());
+            *self.active_receiver_surface.lock().unwrap() = Some(receiver.surface.clone());
             if let Ok(resource) = receiver.resource.upgrade() {
-                info!(app_id = %receiver.app_id, ?orb_state, "Sending voice start to default receiver");
+                info!(?orb_state, "Sending voice start to default receiver");
                 resource.start(orb_state.into());
                 return true;
             }
@@ -225,16 +213,18 @@ impl VoiceModeState {
 
     /// Send stop event to the active receiver
     pub fn send_stop(&self) {
-        let active_app_id = self.active_receiver_app_id.lock().unwrap().clone();
+        let active_surface = self.active_receiver_surface.lock().unwrap().clone();
         *self.current_orb_state.lock().unwrap() = OrbState::Hidden;
-        *self.active_receiver_app_id.lock().unwrap() = None;
+        *self.active_receiver_surface.lock().unwrap() = None;
 
-        if let Some(app_id) = active_app_id {
-            if let Some(receiver) = self.find_receiver(&app_id) {
-                if let Ok(resource) = receiver.resource.upgrade() {
-                    info!(app_id = %app_id, "Sending voice stop to receiver");
-                    resource.stop();
-                    return;
+        if let Some(surface_weak) = active_surface {
+            if let Ok(surface) = surface_weak.upgrade() {
+                if let Some(receiver) = self.find_receiver_by_surface(&surface) {
+                    if let Ok(resource) = receiver.resource.upgrade() {
+                        info!("Sending voice stop to receiver");
+                        resource.stop();
+                        return;
+                    }
                 }
             }
         }
@@ -243,34 +233,36 @@ impl VoiceModeState {
 
     /// Send cancel event to the active receiver
     pub fn send_cancel(&self) {
-        let active_app_id = self.active_receiver_app_id.lock().unwrap().clone();
+        let active_surface = self.active_receiver_surface.lock().unwrap().clone();
         *self.current_orb_state.lock().unwrap() = OrbState::Hidden;
-        *self.active_receiver_app_id.lock().unwrap() = None;
+        *self.active_receiver_surface.lock().unwrap() = None;
 
-        if let Some(app_id) = active_app_id {
-            if let Some(receiver) = self.find_receiver(&app_id) {
-                if let Ok(resource) = receiver.resource.upgrade() {
-                    info!(app_id = %app_id, "Sending voice cancel to receiver");
-                    resource.cancel();
-                    return;
+        if let Some(surface_weak) = active_surface {
+            if let Ok(surface) = surface_weak.upgrade() {
+                if let Some(receiver) = self.find_receiver_by_surface(&surface) {
+                    if let Ok(resource) = receiver.resource.upgrade() {
+                        info!("Sending voice cancel to receiver");
+                        resource.cancel();
+                        return;
+                    }
                 }
             }
         }
         debug!("No active receiver to send cancel to");
     }
 
-    /// Send orb_attached event to a receiver
-    pub fn send_orb_attached(&self, app_id: &str, x: i32, y: i32, width: i32, height: i32) {
-        if let Some(receiver) = self.find_receiver(app_id) {
+    /// Send orb_attached event to a surface's receiver
+    pub fn send_orb_attached(&self, surface: &WlSurface, x: i32, y: i32, width: i32, height: i32) {
+        if let Some(receiver) = self.find_receiver_by_surface(surface) {
             if let Ok(resource) = receiver.resource.upgrade() {
                 resource.orb_attached(x, y, width, height);
             }
         }
     }
 
-    /// Send orb_detached event to a receiver
-    pub fn send_orb_detached(&self, app_id: &str) {
-        if let Some(receiver) = self.find_receiver(app_id) {
+    /// Send orb_detached event to a surface's receiver
+    pub fn send_orb_detached(&self, surface: &WlSurface) {
+        if let Some(receiver) = self.find_receiver_by_surface(surface) {
             if let Ok(resource) = receiver.resource.upgrade() {
                 resource.orb_detached();
             }
@@ -280,19 +272,23 @@ impl VoiceModeState {
     /// Add a receiver
     fn add_receiver(&self, receiver: VoiceReceiver) {
         info!(
-            app_id = %receiver.app_id,
             is_default = receiver.is_default,
-            "Registering voice receiver"
+            "Registering voice receiver for surface"
         );
-        self.receivers.lock().unwrap().push(receiver);
+        // If this is a default receiver, remove any existing default
+        if receiver.is_default {
+            let mut receivers = self.receivers.lock().unwrap();
+            receivers.retain(|r| !r.is_default);
+            receivers.push(receiver);
+        } else {
+            self.receivers.lock().unwrap().push(receiver);
+        }
     }
 
-    /// Check if an app_id has a registered receiver
-    pub fn has_receiver(&self, app_id: &str) -> bool {
-        let receivers = self.receivers.lock().unwrap();
-        receivers
-            .iter()
-            .any(|r| r.app_id == app_id && r.resource.upgrade().is_ok())
+    /// Clean up dead receivers
+    pub fn cleanup_dead_receivers(&self) {
+        let mut receivers = self.receivers.lock().unwrap();
+        receivers.retain(|r| r.resource.upgrade().is_ok() && r.surface.upgrade().is_ok());
     }
 }
 
@@ -304,7 +300,7 @@ pub trait VoiceModeHandler {
     /// Called when voice mode should be activated (compositor decides)
     /// The handler should determine which receiver to send start to
     /// Returns the orb state based on which receiver was activated
-    fn activate_voice_mode(&mut self, focused_app_id: Option<&str>) -> OrbState;
+    fn activate_voice_mode(&mut self, focused_surface: Option<&WlSurface>) -> OrbState;
 
     /// Called when voice mode should be deactivated (key released)
     fn deactivate_voice_mode(&mut self);
@@ -352,19 +348,16 @@ where
         data_init: &mut DataInit<'_, D>,
     ) {
         match request {
-            zcosmic_voice_mode_manager_v1::Request::RegisterReceiver { id, app_id } => {
-                debug!(app_id = %app_id, "Client registering as voice receiver");
-
-                // Check if this is the default receiver
-                let is_default = state
-                    .voice_mode_state()
-                    .default_receiver_app_id
-                    .as_ref()
-                    .map(|default| default == &app_id)
-                    .unwrap_or(false);
+            zcosmic_voice_mode_manager_v1::Request::GetVoiceMode {
+                id,
+                surface,
+                is_default,
+            } => {
+                let is_default = is_default != 0;
+                debug!(is_default, "Client registering surface as voice receiver");
 
                 let receiver_data = VoiceModeReceiverData {
-                    app_id: app_id.clone(),
+                    surface: surface.clone(),
                     is_default,
                 };
                 let resource = data_init.init(id, receiver_data);
@@ -372,19 +365,12 @@ where
                 // Add to receivers list
                 let receiver = VoiceReceiver {
                     resource: resource.downgrade(),
-                    app_id: app_id.clone(),
+                    surface: surface.downgrade(),
                     is_default,
                 };
                 state.voice_mode_state().add_receiver(receiver);
 
-                // Send registered confirmation
-                resource.registered(if is_default { 1 } else { 0 });
-
-                info!(
-                    app_id = %app_id,
-                    is_default,
-                    "Voice receiver registered"
-                );
+                info!(is_default, "Voice receiver registered for surface");
             }
             zcosmic_voice_mode_manager_v1::Request::Destroy => {}
         }
@@ -411,7 +397,7 @@ where
     ) {
         match request {
             zcosmic_voice_mode_v1::Request::Destroy => {
-                debug!(app_id = %data.app_id, "Voice receiver destroyed");
+                debug!(is_default = data.is_default, "Voice receiver destroyed");
             }
         }
     }

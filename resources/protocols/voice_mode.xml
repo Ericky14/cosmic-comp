@@ -28,24 +28,20 @@
     The compositor has full control over the voice mode orb overlay - clients
     only receive notifications and voice input events.
     
-    Apps can register as voice input receivers:
-    1. Window-specific: Receives events when that window is focused
-    2. Default receiver: Receives events when no other receiver is focused
-       (controlled by COSMIC_VOICE_DEFAULT_RECEIVER env var)
-    
+    Clients register specific surfaces (windows) as voice input receivers.
     When voice mode is activated via hotkey:
-    - If a registered receiver window is focused, it gets start/stop/cancel
-    - Otherwise, the default receiver (if any) gets the events
+    - If a registered surface is focused, it receives start/stop/cancel events
+    - If no registered surface is focused, the default receiver (if any) gets events
     
     The orb visual indicator shows where voice input is going:
-    - Floating: Default receiver is handling voice input
+    - Floating: Default receiver is handling voice input  
     - Attached: A specific window is handling voice input
   </description>
 
   <interface name="zcosmic_voice_mode_manager_v1" version="1">
     <description summary="manager for voice mode">
-      This interface allows clients to register as voice input receivers.
-      The compositor controls voice mode; clients receive events.
+      This interface allows clients to register surfaces as voice input receivers.
+      The compositor controls voice mode; clients receive events on their surfaces.
     </description>
 
     <request name="destroy" type="destructor">
@@ -54,23 +50,28 @@
       </description>
     </request>
 
-    <request name="register_receiver">
-      <description summary="register as a voice input receiver">
-        Register this client as a voice input receiver. The app_id identifies
-        which windows can receive voice input when focused.
+    <request name="get_voice_mode">
+      <description summary="get voice mode controller for a surface">
+        Create a voice mode controller for the given wl_surface.
+        The surface will receive voice input events when it is focused
+        and voice mode is activated.
         
-        If the app_id matches COSMIC_VOICE_DEFAULT_RECEIVER, this client
-        becomes the default receiver for when no other receiver is focused.
+        If is_default is non-zero, this surface becomes the default receiver
+        for when no other registered surface is focused. Only one default
+        receiver can be active at a time.
       </description>
       <arg name="id" type="new_id" interface="zcosmic_voice_mode_v1"/>
-      <arg name="app_id" type="string" summary="application ID"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+      <arg name="is_default" type="uint" summary="1 to be default receiver, 0 for window-specific"/>
     </request>
   </interface>
 
   <interface name="zcosmic_voice_mode_v1" version="1">
-    <description summary="voice input receiver">
-      This interface receives voice input events from the compositor.
-      Events are sent based on focus and receiver registration.
+    <description summary="voice input receiver for a surface">
+      This interface receives voice input events from the compositor
+      for a specific surface. Events are sent when:
+      - This surface is focused and voice mode activates (window-specific)
+      - No registered surface is focused and this is the default receiver
     </description>
 
     <enum name="orb_state">
@@ -83,22 +84,14 @@
     </enum>
 
     <request name="destroy" type="destructor">
-      <description summary="unregister as voice input receiver">
-        Destroy this receiver and stop receiving voice input events.
+      <description summary="unregister this surface as voice input receiver">
+        Destroy this receiver. The surface will no longer receive voice input events.
       </description>
     </request>
 
-    <event name="registered">
-      <description summary="registration confirmed">
-        Sent when registration is complete. Indicates whether this client
-        is the default receiver or a window-specific receiver.
-      </description>
-      <arg name="is_default" type="uint" summary="1 if default receiver, 0 if window-specific"/>
-    </event>
-
     <event name="start">
       <description summary="voice input started">
-        Sent when voice input has started and this receiver should begin
+        Sent when voice input has started and this surface should begin
         listening/recording. The client should start capturing audio.
       </description>
       <arg name="orb_state" type="uint" enum="orb_state" summary="where the orb is displayed"/>
@@ -120,20 +113,20 @@
     </event>
 
     <event name="orb_attached">
-      <description summary="orb attached to this receiver's window">
-        Sent when the orb has visually attached to this receiver's window.
-        Includes the window geometry for reference.
+      <description summary="orb attached to this surface">
+        Sent when the orb has visually attached to this surface.
+        Includes the surface geometry for reference.
       </description>
-      <arg name="x" type="int" summary="window x position"/>
-      <arg name="y" type="int" summary="window y position"/>
-      <arg name="width" type="int" summary="window width"/>
-      <arg name="height" type="int" summary="window height"/>
+      <arg name="x" type="int" summary="surface x position"/>
+      <arg name="y" type="int" summary="surface y position"/>
+      <arg name="width" type="int" summary="surface width"/>
+      <arg name="height" type="int" summary="surface height"/>
     </event>
 
     <event name="orb_detached">
-      <description summary="orb detached from this receiver's window">
-        Sent when the orb has detached from this receiver's window
-        (e.g., focus changed to another receiver or default).
+      <description summary="orb detached from this surface">
+        Sent when the orb has detached from this surface
+        (e.g., focus changed to another surface or default).
       </description>
     </event>
   </interface>

@@ -2758,29 +2758,22 @@ impl Shell {
 
     /// Handle focus change for voice mode - transitions between floating and attached orb
     /// Returns true if voice mode active and transition occurred
+    /// Note: The actual receiver check is done at the protocol level via VoiceModeState
     pub fn handle_voice_mode_focus_change(
         &mut self,
         focused_element: Option<&CosmicMapped>,
         output: &Output,
+        has_voice_receiver: bool,
     ) -> bool {
         // Only process if voice mode is active
         if !self.voice_orb_state.is_active() {
             return false;
         }
 
-        // Check if the focused element is the chat window
-        let is_chat_window = focused_element.map_or(false, |mapped| {
-            let app_id = mapped.active_window().app_id();
-            self.voice_orb_state
-                .app_id
-                .as_ref()
-                .map_or(false, |expected| expected == &app_id)
-        });
-
         let output_geo = output.geometry();
 
-        match (is_chat_window, self.voice_orb_state.orb_state) {
-            // Chat window focused and orb is floating -> transition to attached
+        match (has_voice_receiver, self.voice_orb_state.orb_state) {
+            // Receiver window focused and orb is floating -> transition to attached
             (true, crate::wayland::protocols::voice_mode::OrbState::Floating) => {
                 if let Some(mapped) = focused_element {
                     use smithay::desktop::space::SpaceElement;
@@ -2794,7 +2787,7 @@ impl Shell {
                     return true;
                 }
             }
-            // Chat window lost focus and orb is attached -> transition to floating
+            // Receiver window lost focus and orb is attached -> transition to floating
             (false, crate::wayland::protocols::voice_mode::OrbState::Attached) => {
                 self.voice_orb_state.transition_to_floating();
                 // Enable window fading when floating

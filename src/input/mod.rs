@@ -1617,24 +1617,16 @@ impl State {
         let voice_config = &self.common.config.voice_config;
         let matches = voice_config.matches_binding(handle.modified_sym(), modifiers);
         if voice_config.enabled && matches {
-            // Get the focused app_id to determine which receiver to use
-            let focused_app_id = match &current_focus {
-                Some(KeyboardFocusTarget::Element(elem)) => Some(elem.active_window().app_id()),
-                Some(KeyboardFocusTarget::Fullscreen(surface)) => Some(surface.app_id()),
-                _ => None,
-            };
+            // Get the focused surface to determine which receiver to use
+            let focused_surface = current_focus.as_ref().and_then(|f| f.wl_surface());
 
             std::mem::drop(shell); // Release shell lock before protocol calls
 
             if event.state() == KeyState::Pressed {
                 // Activate voice mode via protocol
                 use crate::wayland::protocols::voice_mode::VoiceModeHandler;
-                let orb_state = self.activate_voice_mode(focused_app_id.as_deref());
-                tracing::info!(
-                    ?orb_state,
-                    ?focused_app_id,
-                    "Voice mode activated via hotkey"
-                );
+                let orb_state = self.activate_voice_mode(focused_surface.as_deref());
+                tracing::info!(?orb_state, "Voice mode activated via hotkey");
 
                 // Suppress the key so release is also handled
                 seat.supressed_keys().add(&handle, None);

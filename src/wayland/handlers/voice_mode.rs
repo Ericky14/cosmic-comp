@@ -10,6 +10,7 @@ use crate::wayland::protocols::voice_mode::{
     OrbState, VoiceModeHandler, VoiceModeState, delegate_voice_mode,
 };
 use smithay::desktop::space::SpaceElement;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use tracing::info;
 
 impl VoiceModeHandler for State {
@@ -17,17 +18,21 @@ impl VoiceModeHandler for State {
         &mut self.common.voice_mode_state
     }
 
-    fn activate_voice_mode(&mut self, focused_app_id: Option<&str>) -> OrbState {
-        info!(?focused_app_id, "Activating voice mode");
+    fn activate_voice_mode(&mut self, focused_surface: Option<&WlSurface>) -> OrbState {
+        info!(?focused_surface, "Activating voice mode");
 
         let mut shell = self.common.shell.write();
         let seat = shell.seats.last_active().clone();
         let output = seat.active_output();
 
         // Determine which receiver to use and get window geometry if attaching
-        let (receiver_app_id, window_geo) = if let Some(app_id) = focused_app_id {
-            // Check if focused app has a registered receiver
-            if self.common.voice_mode_state.has_receiver(app_id) {
+        let (receiver_surface, window_geo) = if let Some(surface) = focused_surface {
+            // Check if focused surface has a registered receiver
+            if self
+                .common
+                .voice_mode_state
+                .has_receiver_for_surface(surface)
+            {
                 // Get the focused window's geometry
                 let keyboard = seat.get_keyboard().unwrap();
                 let geo = keyboard.current_focus().and_then(|focus| match &focus {
@@ -36,35 +41,34 @@ impl VoiceModeHandler for State {
                     }
                     _ => None,
                 });
-                (Some(app_id.to_string()), geo)
+                (Some(surface), geo)
             } else {
-                // Focused app doesn't have a receiver, fall back to default
+                // Focused surface doesn't have a receiver, fall back to default
                 (None, None)
             }
         } else {
             (None, None)
         };
 
-        let orb_state = if let Some(app_id) = &receiver_app_id {
+        let orb_state = if let Some(surface) = receiver_surface {
             if let Some(geo) = window_geo {
                 // Attach orb to the focused window
-                info!(app_id = %app_id, "Attaching orb to receiver window");
+                info!("Attaching orb to receiver surface");
                 let output_geo = output.geometry();
                 shell
                     .voice_orb_state
                     .attach_to(geo, output_geo.size.as_logical());
-                shell.voice_orb_state.app_id = Some(app_id.clone());
 
                 // Send start to the window-specific receiver
                 drop(shell);
                 self.common
                     .voice_mode_state
-                    .send_start(app_id, OrbState::Attached);
+                    .send_start_to_surface(surface, OrbState::Attached);
 
                 // Send orb_attached event
                 self.common
                     .voice_mode_state
-                    .send_orb_attached(app_id, geo.loc.x, geo.loc.y, geo.size.w, geo.size.h);
+                    .send_orb_attached(surface, geo.loc.x, geo.loc.y, geo.size.w, geo.size.h);
 
                 OrbState::Attached
             } else {
@@ -102,7 +106,6 @@ impl VoiceModeHandler for State {
 
         // Hide the orb
         shell.voice_orb_state.hide();
-        shell.voice_orb_state.app_id = None;
 
         // Restore faded windows
         shell.exit_voice_mode();
@@ -118,7 +121,6 @@ impl VoiceModeHandler for State {
 
         // Hide the orb
         shell.voice_orb_state.hide();
-        shell.voice_orb_state.app_id = None;
 
         // Restore faded windows
         shell.exit_voice_mode();

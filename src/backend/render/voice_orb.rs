@@ -209,8 +209,6 @@ pub struct VoiceOrbState {
     pub attached_window: Option<Rectangle<i32, Logical>>,
     /// Animation start time for shader time uniform
     pub shader_time_start: Instant,
-    /// App ID for chat windows
-    pub app_id: Option<String>,
 }
 
 impl Default for VoiceOrbState {
@@ -225,7 +223,6 @@ impl Default for VoiceOrbState {
             animation: None,
             attached_window: None,
             shader_time_start: Instant::now(),
-            app_id: None,
         }
     }
 }
