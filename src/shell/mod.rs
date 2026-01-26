@@ -2525,7 +2525,7 @@ impl Shell {
             self.resize_mode,
             ResizeMode::None | ResizeMode::Active(_, _)
         ) || self.home_mode.is_animating()
-            || self.voice_orb_state.animation.is_some()
+            || self.voice_orb_state.needs_continuous_render()
             || self
                 .workspaces
                 .spaces()

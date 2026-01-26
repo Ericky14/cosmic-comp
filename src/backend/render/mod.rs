@@ -963,13 +963,28 @@ impl HomeVisibilityContext {
 
     /// Get visibility and alpha for a surface based on home mode and voice mode
     /// Returns (visible, alpha) where visible indicates if surface should be rendered
-    pub fn surface_visibility(&self, surface_id: u32) -> (bool, f32) {
+    /// 
+    /// The `layer` parameter specifies the layer shell layer (if this is a layer surface).
+    /// Voice mode alpha is NOT applied to Background or Top layer surfaces (wallpaper and panel
+    /// should remain visible during voice mode). All other surfaces fade during voice mode.
+    pub fn surface_visibility(
+        &self,
+        surface_id: u32,
+        layer: Option<smithay::wayland::shell::wlr_layer::Layer>,
+    ) -> (bool, f32) {
+        use smithay::wayland::shell::wlr_layer::Layer;
+
+        // Background and Top layer surfaces should NOT fade during voice mode
+        let skip_voice_mode_alpha = matches!(layer, Some(Layer::Background) | Some(Layer::Top));
+
         if self.home_only_surfaces.contains(&surface_id) {
             // Home-only surface: visible only when home_alpha > 0
-            // BUT also fades out when voice mode is active
             if self.home_alpha > 0.0 {
-                // Apply voice mode alpha to home surfaces too
-                let alpha = self.home_alpha * self.voice_mode_alpha;
+                let alpha = if skip_voice_mode_alpha {
+                    self.home_alpha
+                } else {
+                    self.home_alpha * self.voice_mode_alpha
+                };
                 if alpha > 0.0 {
                     (true, alpha)
                 } else {
@@ -979,17 +994,30 @@ impl HomeVisibilityContext {
                 (false, 0.0)
             }
         } else if self.hide_on_home_surfaces.contains(&surface_id) {
-            // Hide-on-home surface: inverse of home_alpha (visible when NOT in home mode)
-            // Also applies voice mode alpha
-            let alpha = (1.0 - self.home_alpha) * self.voice_mode_alpha;
-            if alpha > 0.0 {
-                (true, alpha)
+            // Hide-on-home surface: inverse of home_alpha
+            let base_alpha = 1.0 - self.home_alpha;
+            if base_alpha > 0.0 {
+                let alpha = if skip_voice_mode_alpha {
+                    base_alpha
+                } else {
+                    base_alpha * self.voice_mode_alpha
+                };
+                if alpha > 0.0 {
+                    (true, alpha)
+                } else {
+                    (false, 0.0)
+                }
             } else {
                 (false, 0.0)
             }
         } else {
-            // Always-visible surface: apply voice mode alpha
-            if self.voice_mode_alpha > 0.0 {
+            // Regular surface (not home-only or hide-on-home)
+            // Still respect skip_voice_mode_alpha for Background/Top layer surfaces like cosmic-bg
+            if skip_voice_mode_alpha {
+                // Background or Top layer surface - always visible, no voice mode fade
+                (true, 1.0)
+            } else if self.voice_mode_alpha > 0.0 {
+                // Apply voice mode alpha (fades during voice mode)
                 (true, self.voice_mode_alpha)
             } else {
                 (false, 0.0)

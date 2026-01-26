@@ -335,6 +335,14 @@ impl VoiceOrbState {
         self.scale > 0.001 || self.animation.is_some()
     }
 
+    /// Check if the orb needs continuous rendering (for shader animation time updates)
+    /// Returns true when the orb is visible and needs frame updates for animation
+    pub fn needs_continuous_render(&self) -> bool {
+        // Need continuous render if orb is visible (shader time needs updating)
+        // or if there's an active scale/position animation
+        self.should_render()
+    }
+
     /// Get the shader time in seconds
     pub fn shader_time(&self) -> f32 {
         self.shader_time_start.elapsed().as_secs_f32()
