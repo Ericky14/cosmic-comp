@@ -715,20 +715,45 @@ impl VoiceOrbState {
     }
 
     /// Update the attached window geometry (call during render to keep orb in sync with window)
-    /// Also updates the position to track the window center
+    /// Also updates the position and burst_scale to track the window center and size
     pub fn update_attached_window_geometry(
         &mut self,
         window_geo: Rectangle<i32, Logical>,
         output_size: Size<i32, Logical>,
     ) {
         if self.orb_state == OrbState::Attached || self.shrinking_from_attached {
+            // Check if window size changed (need to recalculate burst_scale)
+            let size_changed = self.attached_window
+                .map(|old| old.size != window_geo.size)
+                .unwrap_or(true);
+            
             self.attached_window = Some(window_geo);
+            
             // Update position to track window center
             let window_center = Point::from((
                 (window_geo.loc.x as f32 + window_geo.size.w as f32 / 2.0) / output_size.w as f32,
                 (window_geo.loc.y as f32 + window_geo.size.h as f32 / 2.0) / output_size.h as f32,
             ));
             self.position = window_center;
+            
+            // Recalculate burst_scale if window size changed (only when attached, not shrinking)
+            if size_changed && self.orb_state == OrbState::Attached {
+                let floating_orb_size = output_size.w as f32 * 0.20;
+                
+                // For cover effect, orb needs to cover from center to corners
+                let w = window_geo.size.w as f32;
+                let h = window_geo.size.h as f32;
+                let corner_dist = ((w / 2.0).powi(2) + (h / 2.0).powi(2)).sqrt();
+                // Orb diameter needs to be 2 * corner_dist, plus some margin
+                let cover_diameter = corner_dist * 2.0 * 1.25;
+                let new_burst_scale = cover_diameter / floating_orb_size;
+                
+                // Update scale if we're at burst scale (fully expanded)
+                if self.animation.is_none() && (self.scale - self.burst_scale).abs() < 0.01 {
+                    self.scale = new_burst_scale;
+                }
+                self.burst_scale = new_burst_scale;
+            }
         }
     }
 }
@@ -801,18 +826,45 @@ impl VoiceOrbShader {
         let effective_window_geo = window_geo_override.or(orb_state.attached_window);
         
         // Calculate the orb geometry based on state
-        let (geo, orb_scale_in_shader, position_override) = if in_burst_phase {
+        let (geo, orb_scale_in_shader, position_override, effective_scale) = if in_burst_phase {
             // In burst phase: render clipped to window bounds
             // The shader will draw an orb that extends beyond the window
             // but the element geometry clips it
             if let Some(window_geo) = effective_window_geo {
+                // Calculate what burst_scale SHOULD be for this window geometry
+                // This handles dynamic window resizing
+                let w = window_geo.size.w as f32;
+                let h = window_geo.size.h as f32;
+                let corner_dist = ((w / 2.0).powi(2) + (h / 2.0).powi(2)).sqrt();
+                let cover_diameter = corner_dist * 2.0 * 1.25;
+                let correct_burst_scale = cover_diameter / base_orb_size;
+                
+                // If we're at or near burst scale (fully expanded), use the corrected burst scale
+                // Otherwise, we're animating and should use the stored scale proportionally
+                let effective_scale = if orb_state.animation.is_none() 
+                    && (orb_state.scale - orb_state.burst_scale).abs() < 0.01 
+                {
+                    // Fully burst - use the correct burst scale for current window
+                    correct_burst_scale
+                } else {
+                    // Animating - interpolate between 0 and correct burst scale
+                    // based on how far we are in the animation (0 to burst_scale)
+                    let progress = if orb_state.burst_scale > 0.0 {
+                        orb_state.scale / orb_state.burst_scale
+                    } else {
+                        0.0
+                    };
+                    correct_burst_scale * progress
+                };
+                
                 debug!(
                     "Voice orb burst phase: window_geo={:?}, scale={}, position={:?}",
-                    window_geo, orb_state.scale, orb_state.position
+                    window_geo, effective_scale, orb_state.position
                 );
+                
                 // Use window geometry as render bounds (clipping)
                 // Calculate how large the orb appears relative to window
-                let orb_diameter = base_orb_size * orb_state.scale;
+                let orb_diameter = base_orb_size * effective_scale;
                 // Shader uses max(width, height) for normalization, so scale relative to that
                 let window_max = window_geo.size.w.max(window_geo.size.h) as f32;
                 
@@ -826,7 +878,7 @@ impl VoiceOrbShader {
                     (window_geo.loc.y as f32 + window_geo.size.h as f32 / 2.0) / output_geo.size.h as f32,
                 ));
                 
-                (window_geo, scale_in_shader, Some(pos))
+                (window_geo, scale_in_shader, Some(pos), effective_scale)
             } else {
                 return None;
             }
@@ -844,7 +896,7 @@ impl VoiceOrbShader {
                 Size::from((render_size, render_size)),
             );
             // In floating mode, orb scale in shader is 1.0 (normal size)
-            (geo, 1.0f32, None)
+            (geo, 1.0f32, None, orb_state.scale)
         };
 
         // Use position override (from actual window geometry) if available
@@ -884,7 +936,7 @@ impl VoiceOrbShader {
             1.0, // Alpha
             vec![
                 Uniform::new("time", time),
-                Uniform::new("scale", orb_state.scale),
+                Uniform::new("scale", effective_scale),
                 Uniform::new("pulse", pulse),
                 Uniform::new("attached", is_attached),
                 Uniform::new(
