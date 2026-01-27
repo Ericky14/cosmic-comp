@@ -3178,8 +3178,17 @@ impl FloatingLayout {
                             // Get output geometry for orb rendering
                             let output_geo = output.geometry().as_logical();
                             
-                            // Create the voice orb element
-                            if let Some(orb_element) = VoiceOrbShader::element(renderer, orb_state, output_geo) {
+                            // Get the current window geometry for orb positioning
+                            // Use the render geometry (which tracks the window during drag)
+                            let current_window_geo = geometry.as_logical();
+                            
+                            // Create the voice orb element with current window geometry
+                            if let Some(orb_element) = VoiceOrbShader::element_with_window_override(
+                                renderer, 
+                                orb_state, 
+                                output_geo,
+                                Some(current_window_geo),
+                            ) {
                                 // Insert orb element before blur (behind window content, in front of blur)
                                 let orb_geo = orb_element.geometry(output.current_scale().fractional_scale().into());
                                 tracing::debug!(

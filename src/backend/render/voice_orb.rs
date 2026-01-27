@@ -713,6 +713,24 @@ impl VoiceOrbState {
             None
         }
     }
+
+    /// Update the attached window geometry (call during render to keep orb in sync with window)
+    /// Also updates the position to track the window center
+    pub fn update_attached_window_geometry(
+        &mut self,
+        window_geo: Rectangle<i32, Logical>,
+        output_size: Size<i32, Logical>,
+    ) {
+        if self.orb_state == OrbState::Attached || self.shrinking_from_attached {
+            self.attached_window = Some(window_geo);
+            // Update position to track window center
+            let window_center = Point::from((
+                (window_geo.loc.x as f32 + window_geo.size.w as f32 / 2.0) / output_size.w as f32,
+                (window_geo.loc.y as f32 + window_geo.size.h as f32 / 2.0) / output_size.h as f32,
+            ));
+            self.position = window_center;
+        }
+    }
 }
 
 impl VoiceOrbShader {
@@ -756,6 +774,17 @@ impl VoiceOrbShader {
         orb_state: &VoiceOrbState,
         output_geo: Rectangle<i32, Logical>,
     ) -> Option<PixelShaderElement> {
+        Self::element_with_window_override(renderer, orb_state, output_geo, None)
+    }
+
+    /// Create a voice orb render element with an optional window geometry override
+    /// Use this when the window has moved and we need to render the orb at the new position
+    pub fn element_with_window_override<R: AsGlowRenderer>(
+        renderer: &R,
+        orb_state: &VoiceOrbState,
+        output_geo: Rectangle<i32, Logical>,
+        window_geo_override: Option<Rectangle<i32, Logical>>,
+    ) -> Option<PixelShaderElement> {
         if !orb_state.should_render() {
             return None;
         }
@@ -768,12 +797,15 @@ impl VoiceOrbShader {
         // Determine if we should clip to window (burst phase)
         let in_burst_phase = orb_state.is_in_burst_phase();
         
+        // Use override geometry if provided, otherwise fall back to stored geometry
+        let effective_window_geo = window_geo_override.or(orb_state.attached_window);
+        
         // Calculate the orb geometry based on state
-        let (geo, orb_scale_in_shader) = if in_burst_phase {
+        let (geo, orb_scale_in_shader, position_override) = if in_burst_phase {
             // In burst phase: render clipped to window bounds
             // The shader will draw an orb that extends beyond the window
             // but the element geometry clips it
-            if let Some(window_geo) = orb_state.attached_window {
+            if let Some(window_geo) = effective_window_geo {
                 debug!(
                     "Voice orb burst phase: window_geo={:?}, scale={}, position={:?}",
                     window_geo, orb_state.scale, orb_state.position
@@ -788,7 +820,13 @@ impl VoiceOrbShader {
                 // This tells the shader to draw the orb larger than the render area
                 let scale_in_shader = orb_diameter / window_max;
                 
-                (window_geo, scale_in_shader)
+                // Calculate position from actual window geometry
+                let pos = Point::from((
+                    (window_geo.loc.x as f32 + window_geo.size.w as f32 / 2.0) / output_geo.size.w as f32,
+                    (window_geo.loc.y as f32 + window_geo.size.h as f32 / 2.0) / output_geo.size.h as f32,
+                ));
+                
+                (window_geo, scale_in_shader, Some(pos))
             } else {
                 return None;
             }
@@ -806,8 +844,11 @@ impl VoiceOrbShader {
                 Size::from((render_size, render_size)),
             );
             // In floating mode, orb scale in shader is 1.0 (normal size)
-            (geo, 1.0f32)
+            (geo, 1.0f32, None)
         };
+
+        // Use position override (from actual window geometry) if available
+        let position = position_override.unwrap_or(orb_state.position);
 
         // Time for animation
         let time = orb_state.shader_time();
@@ -820,7 +861,7 @@ impl VoiceOrbShader {
 
         // Window aspect ratio and border radius for proper orb rendering when clipped
         let (window_aspect, is_attached, border_radius) = if in_burst_phase {
-            if let Some(window_geo) = orb_state.attached_window {
+            if let Some(window_geo) = effective_window_geo {
                 // Use default window corner radius (22 pixels)
                 use crate::shell::element::DEFAULT_WINDOW_CORNER_RADIUS;
                 (
@@ -848,7 +889,7 @@ impl VoiceOrbShader {
                 Uniform::new("attached", is_attached),
                 Uniform::new(
                     "target_center",
-                    [orb_state.position.x, orb_state.position.y],
+                    [position.x, position.y],
                 ),
                 Uniform::new("morph_progress", 0.0f32), // Deprecated, kept for compatibility
                 Uniform::new("cover_scale", orb_scale_in_shader),
