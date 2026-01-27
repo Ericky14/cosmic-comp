@@ -118,7 +118,34 @@ impl VoiceModeHandler for State {
                 (None, None)
             }
         } else {
-            (None, None)
+            // No focused surface - check for maximized windows with voice receivers
+            // This handles the case where a chat window is maximized but not focused
+            let maximized_receiver = shell.active_space(&output).and_then(|workspace| {
+                workspace.mapped().find_map(|mapped| {
+                    // Check if window is maximized
+                    if !mapped.is_maximized(false) {
+                        return None;
+                    }
+                    // Check if it has a voice receiver
+                    let active_window = mapped.active_window();
+                    let wl_surface = active_window.wl_surface()?;
+                    if !self.common.voice_mode_state.has_receiver_for_surface(&wl_surface) {
+                        return None;
+                    }
+                    // Get geometry
+                    let local_geo = workspace.element_geometry(mapped)?;
+                    let geo = local_geo.to_global(&output).as_logical();
+                    let surface_id = wl_surface.id().to_string();
+                    info!("Found maximized window with voice receiver");
+                    Some((wl_surface.into_owned(), geo, surface_id))
+                })
+            });
+
+            if let Some((surface, geo, surface_id)) = maximized_receiver {
+                (Some(surface), Some((geo, surface_id)))
+            } else {
+                (None, None)
+            }
         };
 
         let orb_state = if let Some(ref surface) = receiver_surface {
