@@ -5,6 +5,7 @@ use crate::{
         BLUR_FALLBACK_ALPHA, BLUR_FALLBACK_COLOR, BLUR_TINT_COLOR, BLUR_TINT_STRENGTH,
         BackdropShader, BlurredBackdropShader, IndicatorShader, Key, Usage, cursor::CursorState,
         element::AsGlowRenderer, get_cached_blur_texture_for_window,
+        voice_orb::{VoiceOrbShader, VoiceOrbState},
     },
     shell::{
         CosmicMapped, CosmicSurface, Direction, ManagedLayer,
@@ -84,6 +85,7 @@ impl MoveGrabState {
         output: &Output,
         theme: &CosmicTheme,
         embedded_children: &[(CosmicMapped, EmbedRenderInfo)],
+        attached_orb_state: Option<&VoiceOrbState>,
     ) -> Vec<I>
     where
         R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
@@ -311,6 +313,41 @@ impl MoveGrabState {
             })
             .collect();
 
+        // Render voice orb if attached to this window
+        let orb_element: Option<CosmicMappedRenderElement<R>> = attached_orb_state
+            .and_then(|orb_state| {
+                // Check if orb is attached to this window
+                if let Some(attached_surface_id) = orb_state.attached_surface_id_for_render() {
+                    let window_surface_id = self.window
+                        .active_window()
+                        .wl_surface()
+                        .map(|s| s.id().to_string());
+                    
+                    if window_surface_id.as_deref() == Some(attached_surface_id) {
+                        // Get output geometry for orb rendering
+                        let output_geo = output.geometry().as_logical();
+                        
+                        // Calculate the current window geometry for the grabbed window
+                        let current_window_geo = Rectangle::new(
+                            render_location,
+                            self.window.geometry().size.to_f64().upscale(scale).to_i32_round(),
+                        );
+                        
+                        // Create the voice orb element with current window geometry
+                        VoiceOrbShader::element_with_window_override(
+                            renderer,
+                            orb_state,
+                            output_geo,
+                            Some(current_window_geo),
+                        ).map(|e| CosmicMappedRenderElement::from(e))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            });
+
         // Embedded windows at the front (top z-order), then rest of the elements
         embedded_elements
             .into_iter()
@@ -357,6 +394,7 @@ impl MoveGrabState {
                                 x => x,
                             }),
                     )
+                    .chain(orb_element)
                     .chain(blur_backdrop_element)
                     .chain(snapping_indicator),
             )

@@ -799,6 +799,7 @@ pub fn cursor_elements<'a, 'frame, R>(
         CosmicMapped,
         crate::wayland::handlers::surface_embed::EmbedRenderInfo,
     )],
+    attached_orb_state: Option<&voice_orb::VoiceOrbState>,
 ) -> Vec<CosmicElement<R>>
 where
     R: Renderer + ImportAll + ImportMem + AsGlowRenderer,
@@ -884,6 +885,7 @@ where
                         output,
                         theme,
                         embedded_children_for_grabbed,
+                        attached_orb_state,
                     )
                 })
             {
@@ -1224,6 +1226,17 @@ where
             .unwrap_or_default()
     };
 
+    // Extract voice orb state BEFORE dropping shell lock
+    // (but after extracting embedded_children_for_grabbed)
+    let grabbed_orb_state: Option<voice_orb::VoiceOrbState> = {
+        let shell_guard = shell.read();
+        if shell_guard.voice_orb_state.should_render_at_window_level() {
+            Some(shell_guard.voice_orb_state.clone())
+        } else {
+            None
+        }
+    };
+
     // we don't want to hold a shell lock across `cursor_elements`,
     // that is prone to deadlock with the main-thread on some grabs.
     std::mem::drop(shell_ref);
@@ -1251,6 +1264,7 @@ where
         *element_filter == ElementFilter::ExcludeWorkspaceOverview,
         skip_move_grab,
         &embedded_children_for_grabbed,
+        grabbed_orb_state.as_ref(),
     ));
 
     // Render voice orb - either globally (floating) or defer to window level (attached)
