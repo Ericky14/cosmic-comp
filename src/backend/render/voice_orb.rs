@@ -27,6 +27,64 @@ use crate::wayland::protocols::voice_mode::{OrbState, VoiceState};
 /// Include the voice orb shader source
 pub static VOICE_ORB_SHADER: &str = include_str!("./shaders/voice_orb.frag");
 
+/// Calculated metrics for orb positioning and scaling relative to a window
+#[derive(Debug, Clone, Copy)]
+pub struct OrbWindowMetrics {
+    /// Normalized position of window center (0.0-1.0)
+    pub center: Point<f32, Logical>,
+    /// Scale to fit orb inside window
+    pub contained_scale: f32,
+    /// Scale to cover entire window (from center to corners)
+    pub burst_scale: f32,
+    /// Base orb size in pixels (20% of output width)
+    pub floating_orb_size: f32,
+}
+
+impl OrbWindowMetrics {
+    /// Calculate all orb metrics for a given window and output size
+    pub fn calculate(
+        window_geo: Rectangle<i32, Logical>,
+        output_size: Size<i32, Logical>,
+    ) -> Self {
+        let floating_orb_size = output_size.w as f32 * 0.20;
+        
+        // Normalized window center position
+        let center = Point::from((
+            (window_geo.loc.x as f32 + window_geo.size.w as f32 / 2.0) / output_size.w as f32,
+            (window_geo.loc.y as f32 + window_geo.size.h as f32 / 2.0) / output_size.h as f32,
+        ));
+        
+        // Scale to fit orb inside window (with margin)
+        let window_min_dim = (window_geo.size.w.min(window_geo.size.h) as f32) * 0.6;
+        let contained_scale = (window_min_dim / floating_orb_size).min(0.5);
+        
+        // Scale to cover from center to corners (with margin)
+        let burst_scale = Self::burst_scale_from_size(window_geo.size, floating_orb_size);
+        
+        Self {
+            center,
+            contained_scale,
+            burst_scale,
+            floating_orb_size,
+        }
+    }
+    
+    /// Calculate burst scale only (for when we just need to update scale on resize)
+    pub fn burst_scale_for_window(window_geo: Rectangle<i32, Logical>, floating_orb_size: f32) -> f32 {
+        Self::burst_scale_from_size(window_geo.size, floating_orb_size)
+    }
+    
+    /// Calculate burst scale from window dimensions
+    fn burst_scale_from_size(size: Size<i32, Logical>, floating_orb_size: f32) -> f32 {
+        let w = size.w as f32;
+        let h = size.h as f32;
+        // Distance from center to corner, times 2 for diameter, plus 25% margin
+        let corner_dist = ((w / 2.0).powi(2) + (h / 2.0).powi(2)).sqrt();
+        let cover_diameter = corner_dist * 2.0 * 1.25;
+        cover_diameter / floating_orb_size
+    }
+}
+
 /// Voice orb shader wrapper
 pub struct VoiceOrbShader(pub GlesPixelProgram);
 
@@ -408,29 +466,11 @@ impl VoiceOrbState {
         output_size: Size<i32, Logical>,
         surface_id: String,
     ) {
-        // Pre-calculate scales and position
-        let window_center = Point::from((
-            (window_geo.loc.x as f32 + window_geo.size.w as f32 / 2.0) / output_size.w as f32,
-            (window_geo.loc.y as f32 + window_geo.size.h as f32 / 2.0) / output_size.h as f32,
-        ));
+        let metrics = OrbWindowMetrics::calculate(window_geo, output_size);
         
-        let floating_orb_size = output_size.w as f32 * 0.20;
-        let window_min_dim = (window_geo.size.w.min(window_geo.size.h) as f32) * 0.6;
-        self.contained_scale = (window_min_dim / floating_orb_size).min(0.5);
-        
-        // For cover effect, orb needs to be larger than the window's max dimension
-        // The shader normalizes by max(width, height), so scale relative to that
-        // Orb radius needs to cover from center to corner, plus margin
-        // For a rectangle, the corner distance from center is sqrt((w/2)^2 + (h/2)^2)
-        let w = window_geo.size.w as f32;
-        let h = window_geo.size.h as f32;
-        let corner_dist = ((w/2.0).powi(2) + (h/2.0).powi(2)).sqrt();
-        // Orb diameter needs to be 2 * corner_dist, plus some margin
-        let cover_diameter = corner_dist * 2.0 * 1.25;
-        self.burst_scale = cover_diameter / floating_orb_size;
-        
-        // Set position to window center now
-        self.position = window_center;
+        self.position = metrics.center;
+        self.contained_scale = metrics.contained_scale;
+        self.burst_scale = metrics.burst_scale;
         self.attached_window = Some(window_geo);
         self.attached_surface_id = Some(surface_id);
         self.pending_show = true;
@@ -515,30 +555,14 @@ impl VoiceOrbState {
         window_geo: Rectangle<i32, Logical>,
         output_size: Size<i32, Logical>,
     ) {
-        let window_center = Point::from((
-            (window_geo.loc.x as f32 + window_geo.size.w as f32 / 2.0) / output_size.w as f32,
-            (window_geo.loc.y as f32 + window_geo.size.h as f32 / 2.0) / output_size.h as f32,
-        ));
+        let metrics = OrbWindowMetrics::calculate(window_geo, output_size);
         
-        // Calculate the floating orb size (20% of display width)
-        let floating_orb_size = output_size.w as f32 * 0.20;
-        
-        // Calculate scale to fit orb inside window (with some margin)
-        // The orb should shrink so it fits within the smaller dimension
-        let window_min_dim = (window_geo.size.w.min(window_geo.size.h) as f32) * 0.6;
-        self.contained_scale = (window_min_dim / floating_orb_size).min(0.5);
-        
-        // For cover effect, orb needs to cover from center to corners
-        let w = window_geo.size.w as f32;
-        let h = window_geo.size.h as f32;
-        let corner_dist = ((w/2.0).powi(2) + (h/2.0).powi(2)).sqrt();
-        // Orb diameter needs to be 2 * corner_dist, plus some margin
-        let cover_diameter = corner_dist * 2.0 * 1.25;
-        self.burst_scale = cover_diameter / floating_orb_size;
+        self.contained_scale = metrics.contained_scale;
+        self.burst_scale = metrics.burst_scale;
         
         self.animation = Some(VoiceOrbAnimation::dart_then_burst(
             self.position,
-            window_center,
+            metrics.center,
             self.scale,
             self.contained_scale,
             self.burst_scale,
@@ -749,29 +773,16 @@ impl VoiceOrbState {
             self.attached_window = Some(window_geo);
             
             // Update position to track window center
-            let window_center = Point::from((
-                (window_geo.loc.x as f32 + window_geo.size.w as f32 / 2.0) / output_size.w as f32,
-                (window_geo.loc.y as f32 + window_geo.size.h as f32 / 2.0) / output_size.h as f32,
-            ));
-            self.position = window_center;
+            let metrics = OrbWindowMetrics::calculate(window_geo, output_size);
+            self.position = metrics.center;
             
             // Recalculate burst_scale if window size changed (only when attached, not shrinking)
             if size_changed && self.orb_state == OrbState::Attached {
-                let floating_orb_size = output_size.w as f32 * 0.20;
-                
-                // For cover effect, orb needs to cover from center to corners
-                let w = window_geo.size.w as f32;
-                let h = window_geo.size.h as f32;
-                let corner_dist = ((w / 2.0).powi(2) + (h / 2.0).powi(2)).sqrt();
-                // Orb diameter needs to be 2 * corner_dist, plus some margin
-                let cover_diameter = corner_dist * 2.0 * 1.25;
-                let new_burst_scale = cover_diameter / floating_orb_size;
-                
                 // Update scale if we're at burst scale (fully expanded)
                 if self.animation.is_none() && (self.scale - self.burst_scale).abs() < 0.01 {
-                    self.scale = new_burst_scale;
+                    self.scale = metrics.burst_scale;
                 }
-                self.burst_scale = new_burst_scale;
+                self.burst_scale = metrics.burst_scale;
             }
         }
     }
@@ -850,13 +861,9 @@ impl VoiceOrbShader {
             // The shader will draw an orb that extends beyond the window
             // but the element geometry clips it
             if let Some(window_geo) = effective_window_geo {
-                // Calculate what burst_scale SHOULD be for this window geometry
+                // Calculate correct burst_scale for current window geometry
                 // This handles dynamic window resizing
-                let w = window_geo.size.w as f32;
-                let h = window_geo.size.h as f32;
-                let corner_dist = ((w / 2.0).powi(2) + (h / 2.0).powi(2)).sqrt();
-                let cover_diameter = corner_dist * 2.0 * 1.25;
-                let correct_burst_scale = cover_diameter / base_orb_size;
+                let correct_burst_scale = OrbWindowMetrics::burst_scale_for_window(window_geo, base_orb_size);
                 
                 // If we're at or near burst scale (fully expanded), use the corrected burst scale
                 // Otherwise, we're animating and should use the stored scale proportionally
@@ -891,7 +898,7 @@ impl VoiceOrbShader {
                 // This tells the shader to draw the orb larger than the render area
                 let scale_in_shader = orb_diameter / window_max;
                 
-                // Calculate position from actual window geometry
+                // Calculate normalized position from actual window geometry
                 let pos = Point::from((
                     (window_geo.loc.x as f32 + window_geo.size.w as f32 / 2.0) / output_geo.size.w as f32,
                     (window_geo.loc.y as f32 + window_geo.size.h as f32 / 2.0) / output_geo.size.h as f32,

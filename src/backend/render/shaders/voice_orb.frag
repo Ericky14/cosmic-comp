@@ -201,7 +201,7 @@ void main() {
     vec3 finalRGB = mix(currentBG, portal.rgb, portal.a);
     
     // Create circular mask for the orb
-    float orbEdge = r0 * 1.25;  // Slight buffer for halo
+    float orbEdge = r0 * 1.15;  // Slight buffer for halo
     float orbMask = 1.0 - smoothstep(orbEdge - 0.05, orbEdge + 0.05, len);
     
     // Final alpha (scale is handled by geometry size, not shader)
