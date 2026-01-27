@@ -2908,6 +2908,22 @@ impl Shell {
             }
         } else {
             // Floating or hidden - use normal voice mode alpha (fades windows out)
+            // BUT: if orb is hidden and we're fading out (transitioning to None),
+            // windows should be visible (alpha = 1.0) because we're exiting voice mode.
+            // The FadingOut animation is for when we're coming from floating mode
+            // where windows were hidden and need to fade back in.
+            // When attached mode exits quickly (scale was already 0), the window
+            // was never hidden, so don't apply the fade animation.
+            if self.voice_orb_state.orb_state == OrbState::Hidden {
+                if let VoiceMode::FadingOut(_) = &self.voice_mode {
+                    // Check if we were in attached mode before by seeing if attached_window is set
+                    // If attached_window is still Some, we were attached and window was visible
+                    if self.voice_orb_state.attached_window.is_some() {
+                        return 1.0;
+                    }
+                }
+            }
+
             self.voice_mode.window_alpha()
         }
     }

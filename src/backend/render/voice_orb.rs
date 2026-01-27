@@ -467,14 +467,29 @@ impl VoiceOrbState {
         if self.orb_state != OrbState::Hidden {
             // When attached, shrink in place; when floating, shrink toward center
             let stay_in_place = self.orb_state == OrbState::Attached;
-            // Track if we're shrinking from attached state (for render layer)
-            self.shrinking_from_attached = stay_in_place;
-            debug!(
-                "Voice orb hiding: stay_in_place={}, shrinking_from_attached={}, position={:?}, scale={}",
-                stay_in_place, self.shrinking_from_attached, self.position, self.scale
-            );
-            self.animation = Some(VoiceOrbAnimation::shrink_out(self.scale, self.position, stay_in_place));
-            self.orb_state = OrbState::Hidden;
+            
+            // If scale is already near 0, skip the animation entirely
+            // This prevents a "meaningless" shrink animation that would keep
+            // shrinking_from_attached=true while scale=0
+            if self.scale < 0.01 {
+                debug!(
+                    "Voice orb hiding: scale already ~0, skipping animation. stay_in_place={}, position={:?}, scale={}",
+                    stay_in_place, self.position, self.scale
+                );
+                self.scale = 0.0;
+                self.animation = None;
+                self.shrinking_from_attached = false;
+                self.orb_state = OrbState::Hidden;
+            } else {
+                // Track if we're shrinking from attached state (for render layer)
+                self.shrinking_from_attached = stay_in_place;
+                debug!(
+                    "Voice orb hiding: stay_in_place={}, shrinking_from_attached={}, position={:?}, scale={}",
+                    stay_in_place, self.shrinking_from_attached, self.position, self.scale
+                );
+                self.animation = Some(VoiceOrbAnimation::shrink_out(self.scale, self.position, stay_in_place));
+                self.orb_state = OrbState::Hidden;
+            }
         }
         self.pending_show = false;
     }
