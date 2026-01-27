@@ -24,7 +24,15 @@ impl VoiceModeHandler for State {
     fn activate_voice_mode(&mut self, focused_surface: Option<&WlSurface>) -> OrbState {
         info!(?focused_surface, "Activating voice mode");
 
+        // Exit home mode when voice mode activates (orb should appear over everything)
+        self.common.home_visibility_state.set_home(false);
+
         let mut shell = self.common.shell.write();
+        
+        // Also exit the shell's internal home mode so home_alpha goes to 0
+        // This ensures home-only surfaces are hidden during voice mode
+        shell.exit_home_visual_only();
+        
         let seat = shell.seats.last_active().clone();
         let output = seat.active_output();
 
@@ -163,18 +171,15 @@ impl VoiceModeHandler for State {
     }
 
     fn deactivate_voice_mode(&mut self) {
-        info!("Deactivating voice mode");
+        info!("Deactivating voice mode - sending will_stop to client");
 
-        // Send stop to active receiver
-        self.common.voice_mode_state.send_stop();
-
-        let mut shell = self.common.shell.write();
-
-        // Request orb hide - will start shrinking, then windows fade in
-        shell.voice_orb_state.request_hide();
-
-        // Start the exit sequence (orb shrinks first, then windows fade in)
-        shell.exit_voice_mode();
+        // Send will_stop to active receiver and wait for ack
+        if self.common.voice_mode_state.send_will_stop().is_none() {
+            // No active receiver, just complete deactivation immediately
+            info!("No active receiver, completing deactivation immediately");
+            self.complete_deactivation();
+        }
+        // Otherwise, wait for ack_stop from client (or timeout)
     }
 
     fn cancel_voice_mode(&mut self) {
@@ -190,6 +195,97 @@ impl VoiceModeHandler for State {
 
         // Start the exit sequence (orb shrinks first, then windows fade in)
         shell.exit_voice_mode();
+    }
+
+    fn freeze_orb(&mut self) {
+        info!("Freezing orb for transcription processing (client requested freeze via ack_stop)");
+
+        // Send stop to active receiver so it can trigger transcription
+        self.common.voice_mode_state.send_stop();
+
+        let mut shell = self.common.shell.write();
+
+        // Freeze the orb in place (stops pulsing, stays visible)
+        shell.voice_orb_state.freeze();
+
+        // Update protocol state
+        drop(shell);
+        self.common.voice_mode_state.set_orb_state(OrbState::Frozen);
+    }
+
+    fn complete_deactivation(&mut self) {
+        info!("Completing voice mode deactivation (proceeding with hide)");
+
+        // Send stop to active receiver
+        self.common.voice_mode_state.send_stop();
+
+        let mut shell = self.common.shell.write();
+
+        // Request orb hide - will start shrinking, then windows fade in
+        shell.voice_orb_state.request_hide();
+
+        // Start the exit sequence (orb shrinks first, then windows fade in)
+        shell.exit_voice_mode();
+    }
+
+    fn check_pending_stop_timeout(&mut self) {
+        if self.common.voice_mode_state.has_pending_stop_timeout() {
+            info!("will_stop timeout - completing deactivation");
+            self.complete_deactivation();
+        }
+    }
+
+    fn on_voice_receiver_registered(&mut self, surface: &WlSurface) {
+        // Check if orb is currently frozen - if so, we need to transition to the new window
+        let shell = self.common.shell.read();
+        if shell.voice_orb_state.orb_state != OrbState::Frozen {
+            return;
+        }
+        drop(shell);
+
+        info!("Voice receiver registered while orb is frozen - checking for transition");
+
+        // Find the window that owns this surface
+        let shell = self.common.shell.read();
+        let seat = shell.seats.last_active().clone();
+        let output = seat.active_output();
+        
+        // Search for the mapped element that contains this surface
+        let workspace = shell.active_space(&output);
+        let window_info = workspace.and_then(|ws| {
+            ws.mapped().find_map(|mapped| {
+                if let Some(wl_surface) = mapped.active_window().wl_surface() {
+                    if wl_surface.id() == surface.id() {
+                        let window_geo = SpaceElement::geometry(mapped);
+                        let surface_id = wl_surface.id().to_string();
+                        return Some((window_geo, surface_id));
+                    }
+                }
+                None
+            })
+        });
+        drop(shell);
+
+        if let Some((window_geo, surface_id)) = window_info {
+            info!(
+                ?window_geo,
+                surface_id,
+                "Transitioning frozen orb to newly registered receiver window"
+            );
+
+            let mut shell = self.common.shell.write();
+            let output_size = output.geometry().size.as_logical();
+
+            // Start the attach_and_transition animation
+            shell
+                .voice_orb_state
+                .start_attach_and_transition(window_geo, output_size, surface_id);
+
+            // Fade windows back in
+            shell.voice_mode_fade_in_immediately();
+        } else {
+            info!("Could not find window for registered voice receiver surface");
+        }
     }
 }
 

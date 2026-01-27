@@ -31,6 +31,8 @@ use smithay::reexports::wayland_server::{
     backend::GlobalId, protocol::wl_surface::WlSurface,
 };
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 /// Orb display state
@@ -40,6 +42,17 @@ pub enum OrbState {
     Hidden,
     Floating,
     Attached,
+    /// Orb is frozen in place waiting for transcription (non-interruptible)
+    Frozen,
+    /// Orb is transitioning to attached with fade animation (non-interruptible)
+    Transitioning,
+}
+
+impl OrbState {
+    /// Check if this state is non-interruptible (hotkeys should be ignored)
+    pub fn is_non_interruptible(&self) -> bool {
+        matches!(self, OrbState::Frozen | OrbState::Transitioning)
+    }
 }
 
 impl From<u32> for OrbState {
@@ -47,6 +60,8 @@ impl From<u32> for OrbState {
         match value {
             1 => OrbState::Floating,
             2 => OrbState::Attached,
+            3 => OrbState::Frozen,
+            4 => OrbState::Transitioning,
             _ => OrbState::Hidden,
         }
     }
@@ -58,6 +73,8 @@ impl From<OrbState> for u32 {
             OrbState::Hidden => 0,
             OrbState::Floating => 1,
             OrbState::Attached => 2,
+            OrbState::Frozen => 3,
+            OrbState::Transitioning => 4,
         }
     }
 }
@@ -68,6 +85,8 @@ impl From<OrbState> for zcosmic_voice_mode_v1::OrbState {
             OrbState::Hidden => zcosmic_voice_mode_v1::OrbState::Hidden,
             OrbState::Floating => zcosmic_voice_mode_v1::OrbState::Floating,
             OrbState::Attached => zcosmic_voice_mode_v1::OrbState::Attached,
+            OrbState::Frozen => zcosmic_voice_mode_v1::OrbState::Frozen,
+            OrbState::Transitioning => zcosmic_voice_mode_v1::OrbState::Transitioning,
         }
     }
 }
@@ -99,6 +118,18 @@ pub struct VoiceReceiver {
     pub is_default: bool,
 }
 
+/// Pending stop state - waiting for client to ack will_stop
+#[derive(Debug, Clone)]
+pub struct PendingStop {
+    /// Serial sent with will_stop
+    pub serial: u32,
+    /// Time when will_stop was sent
+    pub sent_at: Instant,
+}
+
+/// Timeout for will_stop ack (200ms - needs to account for event loop latency)
+pub const WILL_STOP_TIMEOUT_MS: u128 = 200;
+
 /// State for the voice mode manager protocol
 pub struct VoiceModeState {
     global: GlobalId,
@@ -110,6 +141,10 @@ pub struct VoiceModeState {
     active_receiver_surface: Mutex<Option<Weak<WlSurface>>>,
     /// Current audio level from client (0-1000)
     audio_level: Mutex<u32>,
+    /// Serial counter for will_stop events
+    serial_counter: AtomicU32,
+    /// Pending stop state (waiting for ack_stop)
+    pending_stop: Mutex<Option<PendingStop>>,
 }
 
 impl std::fmt::Debug for VoiceModeState {
@@ -122,6 +157,7 @@ impl std::fmt::Debug for VoiceModeState {
                 &self.active_receiver_surface.lock().unwrap().is_some(),
             )
             .field("audio_level", &self.audio_level.lock().unwrap())
+            .field("pending_stop", &self.pending_stop.lock().unwrap())
             .finish()
     }
 }
@@ -145,6 +181,8 @@ impl VoiceModeState {
             current_orb_state: Mutex::new(OrbState::Hidden),
             active_receiver_surface: Mutex::new(None),
             audio_level: Mutex::new(0),
+            serial_counter: AtomicU32::new(1),
+            pending_stop: Mutex::new(None),
         }
     }
 
@@ -161,6 +199,11 @@ impl VoiceModeState {
     /// Get current orb state
     pub fn orb_state(&self) -> OrbState {
         *self.current_orb_state.lock().unwrap()
+    }
+
+    /// Set current orb state
+    pub fn set_orb_state(&self, state: OrbState) {
+        *self.current_orb_state.lock().unwrap() = state;
     }
 
     /// Find a receiver by surface
@@ -215,11 +258,12 @@ impl VoiceModeState {
         false
     }
 
-    /// Send stop event to the active receiver
+    /// Send stop event to the active receiver (called after ack_stop with freeze=false, or timeout)
     pub fn send_stop(&self) {
         let active_surface = self.active_receiver_surface.lock().unwrap().clone();
         *self.current_orb_state.lock().unwrap() = OrbState::Hidden;
         *self.active_receiver_surface.lock().unwrap() = None;
+        *self.pending_stop.lock().unwrap() = None;
         self.reset_audio_level();
 
         if let Some(surface_weak) = active_surface {
@@ -236,11 +280,81 @@ impl VoiceModeState {
         debug!("No active receiver to send stop to");
     }
 
+    /// Send will_stop event to the active receiver and start waiting for ack
+    /// Returns the serial used, or None if no active receiver
+    pub fn send_will_stop(&self) -> Option<u32> {
+        let active_surface = self.active_receiver_surface.lock().unwrap().clone();
+        
+        if let Some(surface_weak) = active_surface {
+            if let Ok(surface) = surface_weak.upgrade() {
+                if let Some(receiver) = self.find_receiver_by_surface(&surface) {
+                    if let Ok(resource) = receiver.resource.upgrade() {
+                        let serial = self.serial_counter.fetch_add(1, Ordering::SeqCst);
+                        info!(serial, "Sending will_stop to receiver");
+                        resource.will_stop(serial);
+                        
+                        // Store pending stop state
+                        *self.pending_stop.lock().unwrap() = Some(PendingStop {
+                            serial,
+                            sent_at: Instant::now(),
+                        });
+                        
+                        return Some(serial);
+                    }
+                }
+            }
+        }
+        debug!("No active receiver to send will_stop to");
+        None
+    }
+
+    /// Check if we have a pending stop that has timed out
+    pub fn has_pending_stop_timeout(&self) -> bool {
+        if let Some(ref pending) = *self.pending_stop.lock().unwrap() {
+            pending.sent_at.elapsed().as_millis() >= WILL_STOP_TIMEOUT_MS
+        } else {
+            false
+        }
+    }
+
+    /// Check if we have any pending stop (waiting for ack)
+    pub fn has_pending_stop(&self) -> bool {
+        self.pending_stop.lock().unwrap().is_some()
+    }
+
+    /// Handle ack_stop from client
+    /// Returns true if serial matches and freeze was requested
+    pub fn handle_ack_stop(&self, serial: u32, freeze: bool) -> Option<bool> {
+        let mut pending = self.pending_stop.lock().unwrap();
+        if let Some(ref pending_stop) = *pending {
+            if pending_stop.serial == serial {
+                info!(serial, freeze, "Received ack_stop from client");
+                *pending = None;
+                return Some(freeze);
+            } else {
+                warn!(
+                    expected = pending_stop.serial,
+                    received = serial,
+                    "ack_stop serial mismatch"
+                );
+            }
+        } else {
+            warn!(serial, "ack_stop received but no pending stop");
+        }
+        None
+    }
+
+    /// Clear pending stop without sending stop (used when freezing)
+    pub fn clear_pending_stop(&self) {
+        *self.pending_stop.lock().unwrap() = None;
+    }
+
     /// Send cancel event to the active receiver
     pub fn send_cancel(&self) {
         let active_surface = self.active_receiver_surface.lock().unwrap().clone();
         *self.current_orb_state.lock().unwrap() = OrbState::Hidden;
         *self.active_receiver_surface.lock().unwrap() = None;
+        *self.pending_stop.lock().unwrap() = None;
         self.reset_audio_level();
 
         if let Some(surface_weak) = active_surface {
@@ -329,10 +443,26 @@ pub trait VoiceModeHandler {
     fn activate_voice_mode(&mut self, focused_surface: Option<&WlSurface>) -> OrbState;
 
     /// Called when voice mode should be deactivated (key released)
+    /// This should send will_stop and wait for ack_stop
     fn deactivate_voice_mode(&mut self);
 
     /// Called when voice mode should be cancelled (focus change, escape, etc)
     fn cancel_voice_mode(&mut self);
+
+    /// Called when client acknowledges will_stop with freeze=true
+    /// Orb stops pulsing and stays visible. Compositor handles auto-transition on focus change.
+    fn freeze_orb(&mut self);
+
+    /// Called when client acknowledges will_stop with freeze=false, or timeout
+    /// Proceeds with hiding the orb
+    fn complete_deactivation(&mut self);
+
+    /// Called periodically to check for pending stop timeout
+    fn check_pending_stop_timeout(&mut self);
+
+    /// Called when a new voice receiver is registered
+    /// If orb is frozen, this can trigger transition to the new window
+    fn on_voice_receiver_registered(&mut self, surface: &WlSurface);
 }
 
 impl<D> GlobalDispatch<zcosmic_voice_mode_manager_v1::ZcosmicVoiceModeManagerV1, (), D>
@@ -397,6 +527,10 @@ where
                 state.voice_mode_state().add_receiver(receiver);
 
                 info!(is_default, "Voice receiver registered for surface");
+
+                // Notify handler that a new receiver was registered
+                // This allows transitioning frozen orb to the new window
+                state.on_voice_receiver_registered(&surface);
             }
             zcosmic_voice_mode_manager_v1::Request::Destroy => {}
         }
@@ -429,6 +563,20 @@ where
                 // Only accept audio level updates if voice mode is active
                 if state.voice_mode_state().is_active() {
                     state.voice_mode_state().set_audio_level(level);
+                }
+            }
+            zcosmic_voice_mode_v1::Request::AckStop { serial, freeze } => {
+                let freeze = freeze != 0;
+                info!(serial, freeze, "Client ack_stop received");
+                
+                if let Some(should_freeze) = state.voice_mode_state().handle_ack_stop(serial, freeze) {
+                    if should_freeze {
+                        // Client wants to freeze the orb
+                        state.freeze_orb();
+                    } else {
+                        // Client wants to proceed with hide
+                        state.complete_deactivation();
+                    }
                 }
             }
         }

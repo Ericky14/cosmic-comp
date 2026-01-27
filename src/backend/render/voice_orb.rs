@@ -130,6 +130,23 @@ pub enum VoiceOrbAnimation {
         start_scale: f32,
         contained_scale: f32,
     },
+    /// Burst to fill window then fade out (for attach_and_transition)
+    /// Orb expands to burst scale while fading out opacity
+    BurstThenFadeOut {
+        start_time: Instant,
+        /// Duration of burst phase
+        burst_duration: f32,
+        /// Duration of fade phase (overlaps with burst end)
+        fade_duration: f32,
+        /// Starting position
+        start_position: Point<f32, Logical>,
+        /// Window center position (normalized)
+        window_center: Point<f32, Logical>,
+        /// Starting scale
+        start_scale: f32,
+        /// Final burst scale (to cover window)
+        burst_scale: f32,
+    },
 }
 
 impl VoiceOrbAnimation {
@@ -212,6 +229,25 @@ impl VoiceOrbAnimation {
         }
     }
 
+    /// Create an animation to burst and fade out (for attach_and_transition)
+    /// The orb expands to fill the window while fading out
+    pub fn burst_then_fade_out(
+        current_position: Point<f32, Logical>,
+        window_center: Point<f32, Logical>,
+        current_scale: f32,
+        burst_scale: f32,
+    ) -> Self {
+        Self::BurstThenFadeOut {
+            start_time: Instant::now(),
+            burst_duration: 0.4,  // Burst to fill window
+            fade_duration: 0.3,   // Fade out (starts during burst)
+            start_position: current_position,
+            window_center,
+            start_scale: current_scale,
+            burst_scale,
+        }
+    }
+
     /// Get the animation progress (0.0 to 1.0)
     pub fn progress(&self) -> f32 {
         match self {
@@ -227,6 +263,12 @@ impl VoiceOrbAnimation {
             Self::ShrinkThenDart { start_time, shrink_duration, dart_duration, .. } => {
                 let elapsed = start_time.elapsed().as_secs_f32();
                 let total = shrink_duration + dart_duration;
+                (elapsed / total).min(1.0)
+            }
+            Self::BurstThenFadeOut { start_time, burst_duration, fade_duration, .. } => {
+                let elapsed = start_time.elapsed().as_secs_f32();
+                // Total time is burst + overlap with fade
+                let total = *burst_duration + (*fade_duration * 0.5); // Fade starts at 50% of burst
                 (elapsed / total).min(1.0)
             }
         }
@@ -247,7 +289,30 @@ impl VoiceOrbAnimation {
                 // In shrink phase (not yet darting) - still attached
                 start_time.elapsed().as_secs_f32() < *shrink_duration
             }
+            Self::BurstThenFadeOut { .. } => {
+                // Always in burst phase for this animation
+                true
+            }
             _ => false,
+        }
+    }
+
+    /// Get the current opacity (for BurstThenFadeOut animation)
+    /// Returns 1.0 for animations that don't affect opacity
+    pub fn current_opacity(&self) -> f32 {
+        match self {
+            Self::BurstThenFadeOut { start_time, burst_duration, fade_duration, .. } => {
+                let elapsed = start_time.elapsed().as_secs_f32();
+                // Fade starts at 50% of burst duration
+                let fade_start = burst_duration * 0.5;
+                if elapsed < fade_start {
+                    1.0
+                } else {
+                    let fade_progress = (elapsed - fade_start) / fade_duration;
+                    (1.0 - fade_progress.min(1.0)).max(0.0)
+                }
+            }
+            _ => 1.0,
         }
     }
 
@@ -298,6 +363,17 @@ impl VoiceOrbAnimation {
                     contained_scale + (1.0 - contained_scale) * eased_t
                 }
             }
+            Self::BurstThenFadeOut {
+                start_time, burst_duration,
+                start_scale, burst_scale, ..
+            } => {
+                let elapsed = start_time.elapsed().as_secs_f32();
+                let t = (elapsed / burst_duration).min(1.0);
+                // Use simple ease out for burst+fade transition (no spring bounce)
+                // Spring looks weird when combined with fade out
+                let eased_t = ease(EaseOutCubic, 0.0, 1.0, t);
+                start_scale + (burst_scale - start_scale) * eased_t
+            }
         }
     }
 
@@ -345,6 +421,24 @@ impl VoiceOrbAnimation {
                         window_center.x + (target_position.x - window_center.x) * eased_t,
                         window_center.y + (target_position.y - window_center.y) * eased_t,
                     ))
+                }
+            }
+            Self::BurstThenFadeOut {
+                start_time, burst_duration,
+                start_position, window_center, ..
+            } => {
+                let elapsed = start_time.elapsed().as_secs_f32();
+                if elapsed < *burst_duration * 0.3 {
+                    // First 30%: move to window center
+                    let t = elapsed / (burst_duration * 0.3);
+                    let eased_t = ease(EaseOutCubic, 0.0, 1.0, t);
+                    Point::from((
+                        start_position.x + (window_center.x - start_position.x) * eased_t,
+                        start_position.y + (window_center.y - start_position.y) * eased_t,
+                    ))
+                } else {
+                    // Rest: stay at window center
+                    *window_center
                 }
             }
         }
@@ -404,6 +498,8 @@ pub struct VoiceOrbState {
     pub scale: f32,
     /// Current position (normalized to output)
     pub position: Point<f32, Logical>,
+    /// Current opacity (0.0 = transparent, 1.0 = fully visible)
+    pub opacity: f32,
     /// Current smoothed pulse intensity (0.0 to 1.0)
     pub pulse_intensity: f32,
     /// Target pulse intensity for smooth interpolation
@@ -426,6 +522,8 @@ pub struct VoiceOrbState {
     contained_scale: f32,
     /// True when shrinking from attached state (keep rendering at window level)
     pub shrinking_from_attached: bool,
+    /// True when attach_and_transition animation just completed (for state sync)
+    pub transition_just_completed: bool,
 }
 
 impl Default for VoiceOrbState {
@@ -435,6 +533,7 @@ impl Default for VoiceOrbState {
             voice_state: VoiceState::Idle,
             scale: 0.0,
             position: Point::from((0.5, 0.5)),
+            opacity: 1.0,
             pulse_intensity: 0.0,
             target_pulse_intensity: 0.0,
             animation: None,
@@ -446,6 +545,7 @@ impl Default for VoiceOrbState {
             burst_scale: 1.0,
             contained_scale: 0.3,
             shrinking_from_attached: false,
+            transition_just_completed: false,
         }
     }
 }
@@ -602,6 +702,57 @@ impl VoiceOrbState {
         }
     }
 
+    /// Freeze the orb in place (for transcription processing)
+    /// Orb stops pulsing and stays visible until attach_and_transition or cancel
+    pub fn freeze(&mut self) {
+        // Only freeze if currently floating
+        if self.orb_state == OrbState::Floating {
+            debug!("Freezing orb in place for transcription processing");
+            self.orb_state = OrbState::Frozen;
+            // Stop any pulsing
+            self.pulse_intensity = 0.0;
+            self.target_pulse_intensity = 0.0;
+            self.voice_state = VoiceState::Idle;
+        }
+    }
+
+    /// Start the attach and transition animation (burst + fade out)
+    /// This is called when a new chat window opens after transcription
+    pub fn start_attach_and_transition(
+        &mut self,
+        window_geo: Rectangle<i32, Logical>,
+        output_size: Size<i32, Logical>,
+        surface_id: String,
+    ) {
+        // Only valid from Frozen state
+        if self.orb_state != OrbState::Frozen {
+            debug!("attach_and_transition called but orb not frozen, ignoring");
+            return;
+        }
+
+        let metrics = OrbWindowMetrics::calculate(window_geo, output_size);
+        
+        debug!(
+            "Starting attach_and_transition: window={:?}, burst_scale={}",
+            window_geo, metrics.burst_scale
+        );
+
+        self.burst_scale = metrics.burst_scale;
+        self.contained_scale = metrics.contained_scale;
+        self.attached_window = Some(window_geo);
+        self.attached_surface_id = Some(surface_id);
+        self.orb_state = OrbState::Transitioning;
+        self.opacity = 1.0;
+
+        // Start burst + fade animation
+        self.animation = Some(VoiceOrbAnimation::burst_then_fade_out(
+            self.position,
+            metrics.center,
+            self.scale,
+            metrics.burst_scale,
+        ));
+    }
+
     /// Check if voice mode is currently active (not hidden)
     pub fn is_active(&self) -> bool {
         self.orb_state != OrbState::Hidden
@@ -611,10 +762,21 @@ impl VoiceOrbState {
     pub fn update(&mut self) {
         // Update pulse intensity smoothing every frame
         self.update_pulse();
+        
+        // Clear the transition completion flag at the start of each update
+        // (it should be consumed by the caller after previous update)
+        self.transition_just_completed = false;
 
         if let Some(ref animation) = self.animation {
             self.scale = animation.current_scale();
             self.position = animation.current_position();
+            
+            // Update opacity for fade-out animations
+            let new_opacity = animation.current_opacity();
+            if self.orb_state == OrbState::Transitioning && (self.opacity - new_opacity).abs() > 0.01 {
+                debug!("Voice orb transitioning: opacity changing from {} to {}", self.opacity, new_opacity);
+            }
+            self.opacity = new_opacity;
 
             if animation.is_complete() {
                 // Animation done, clear it
@@ -629,6 +791,19 @@ impl VoiceOrbState {
                     // Clear attached window info when fully hidden
                     self.attached_window = None;
                     self.attached_surface_id = None;
+                    self.opacity = 1.0;
+                }
+                // If transitioning (attach_and_transition), complete -> hidden
+                if self.orb_state == OrbState::Transitioning {
+                    debug!("attach_and_transition animation complete, transitioning to hidden");
+                    self.orb_state = OrbState::Hidden;
+                    self.scale = 0.0;
+                    self.position = Point::from((0.5, 0.5));
+                    self.attached_window = None;
+                    self.attached_surface_id = None;
+                    self.opacity = 1.0;
+                    // Set flag for external state sync
+                    self.transition_just_completed = true;
                 }
                 // If attached, ensure we're at burst scale
                 if self.orb_state == OrbState::Attached {
@@ -646,6 +821,10 @@ impl VoiceOrbState {
     pub fn is_in_burst_phase(&self) -> bool {
         // If shrinking from attached, we're still in burst phase (need clipping)
         if self.shrinking_from_attached {
+            return true;
+        }
+        // Transitioning state is always in burst phase (orb expands over window)
+        if self.orb_state == OrbState::Transitioning {
             return true;
         }
         // If not attached, never in burst phase
@@ -670,6 +849,10 @@ impl VoiceOrbState {
                 // Simple animation while attached - we're bursting if scale > 1
                 // (burst_only animation has target_scale > 1, shrink has target 0)
                 *target_scale > 1.0
+            }
+            Some(VoiceOrbAnimation::BurstThenFadeOut { .. }) => {
+                // Always in burst phase during this animation
+                true
             }
             None => true,
         }
@@ -959,7 +1142,7 @@ impl VoiceOrbShader {
             shader,
             geo,
             None,
-            1.0, // Alpha
+            orb_state.opacity, // Use opacity from orb state for fade effects
             vec![
                 Uniform::new("time", time),
                 Uniform::new("scale", effective_scale),

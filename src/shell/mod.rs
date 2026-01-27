@@ -2704,6 +2704,12 @@ impl Shell {
         self.home_mode.alpha()
     }
 
+    /// Exit home mode visually only (fade out home surfaces without restoring windows)
+    /// Use this when another mode like voice mode takes over
+    pub fn exit_home_visual_only(&mut self) {
+        self.home_mode.exit();
+    }
+
     /// Enter home mode (with animation) and minimize all windows
     pub fn enter_home(&mut self) {
         self.home_mode.enter();
@@ -2840,6 +2846,11 @@ impl Shell {
         self.voice_mode.exit();
     }
 
+    /// Fade windows in immediately (for attached mode transitions)
+    pub fn voice_mode_fade_in_immediately(&mut self) {
+        self.voice_mode.fade_in_immediately();
+    }
+
     /// Handle focus change for voice mode - transitions between floating and attached orb
     /// Returns true if voice mode active and transition occurred
     /// Note: The actual receiver check is done at the protocol level via VoiceModeState
@@ -2871,6 +2882,27 @@ impl Shell {
                     return true;
                 }
             }
+            // Receiver window focused and orb is frozen -> start attach_and_transition animation
+            // This happens when chat-ui window opens/focuses after transcription completes
+            (true, crate::wayland::protocols::voice_mode::OrbState::Frozen) => {
+                if let Some(mapped) = focused_element {
+                    use smithay::desktop::space::SpaceElement;
+                    let window_geo = SpaceElement::geometry(mapped);
+                    let output_size = output_geo.size.as_logical();
+                    // Get the surface ID for the attached window
+                    let surface_id = mapped
+                        .active_window()
+                        .wl_surface()
+                        .map(|s| s.id().to_string())
+                        .unwrap_or_default();
+                    self.voice_orb_state
+                        .start_attach_and_transition(window_geo, output_size, surface_id);
+                    // Fade windows back in (orb will burst then fade out)
+                    self.voice_mode.fade_in_immediately();
+                    tracing::debug!("Voice orb: frozen -> attach_and_transition to newly focused window");
+                    return true;
+                }
+            }
             // Receiver window lost focus and orb is attached -> transition to floating
             (false, crate::wayland::protocols::voice_mode::OrbState::Attached) => {
                 self.voice_orb_state.transition_to_floating();
@@ -2891,11 +2923,13 @@ impl Shell {
     pub fn voice_mode_window_alpha(&self) -> f32 {
         use crate::wayland::protocols::voice_mode::OrbState;
         
-        // Windows stay visible when attached OR when shrinking from attached state
+        // Windows stay visible when attached, frozen, transitioning, or shrinking from attached
         if self.voice_orb_state.orb_state == OrbState::Attached 
+            || self.voice_orb_state.orb_state == OrbState::Frozen
+            || self.voice_orb_state.orb_state == OrbState::Transitioning
             || self.voice_orb_state.shrinking_from_attached 
         {
-            // When attached (or shrinking from attached), windows should be visible
+            // When attached/frozen/transitioning, windows should be visible
             // But respect the animation state for smooth transitions
             match &self.voice_mode {
                 // Use animation alpha during FadingOut (fade-in animation)

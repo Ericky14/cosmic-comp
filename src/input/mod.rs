@@ -1618,6 +1618,18 @@ impl State {
         let voice_config = &self.common.config.voice_config;
         let matches = voice_config.matches_binding(handle.modified_sym(), modifiers);
         if voice_config.enabled && matches {
+            // Check if voice mode is in a non-interruptible state (frozen, transitioning)
+            // During these states, pressing the key again will cancel voice mode
+            if self.common.voice_mode_state.orb_state().is_non_interruptible() {
+                if event.state() == KeyState::Pressed {
+                    tracing::debug!("Voice mode interrupted during freeze/transition - cancelling");
+                    std::mem::drop(shell); // Release shell lock before protocol calls
+                    use crate::wayland::protocols::voice_mode::VoiceModeHandler;
+                    self.cancel_voice_mode();
+                }
+                return FilterResult::Intercept(None);
+            }
+
             // Get the focused surface to determine which receiver to use
             let focused_surface = current_focus.as_ref().and_then(|f| f.wl_surface());
 

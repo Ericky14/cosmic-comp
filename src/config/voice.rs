@@ -3,7 +3,7 @@
 //! Voice mode configuration
 //!
 //! This module provides shared configuration for voice mode keybindings
-//! that can be used by both cosmic-comp and humainos-voice.
+//! that can be used by both cosmic-comp.
 
 use cosmic_config::{Config, ConfigGet, ConfigSet, CosmicConfigEntry};
 use serde::{Deserialize, Serialize};

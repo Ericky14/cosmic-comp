@@ -81,6 +81,8 @@
       <entry name="hidden" value="0" summary="orb is not visible"/>
       <entry name="floating" value="1" summary="orb is floating (default receiver active)"/>
       <entry name="attached" value="2" summary="orb is attached to a window"/>
+      <entry name="frozen" value="3" summary="orb is frozen in place (processing)"/>
+      <entry name="transitioning" value="4" summary="orb is transitioning to attached (non-interruptible)"/>
     </enum>
 
     <request name="destroy" type="destructor">
@@ -102,6 +104,24 @@
         The compositor uses this to animate the voice orb (pulsing, glow, etc.).
       </description>
       <arg name="level" type="uint" summary="audio level 0-1000 (0=silence, 1000=max)"/>
+    </request>
+
+    <request name="ack_stop">
+      <description summary="acknowledge will_stop and decide whether to freeze">
+        Respond to a will_stop event from the compositor. The client must send
+        this within a short time (typically 100ms) after receiving will_stop.
+        
+        If freeze is non-zero, the orb will freeze in place instead of hiding.
+        This is used when transcription is still processing and the client wants
+        the orb to remain visible until a new chat window opens.
+        
+        If freeze is zero, the orb will proceed with the normal hide animation.
+        
+        If the client doesn't respond in time, the compositor will proceed with
+        hiding as a fail-safe.
+      </description>
+      <arg name="serial" type="uint" summary="serial from the will_stop event"/>
+      <arg name="freeze" type="uint" summary="1 to freeze orb, 0 to proceed with hide"/>
     </request>
 
     <event name="start">
@@ -143,6 +163,20 @@
         Sent when the orb has detached from this surface
         (e.g., focus changed to another surface or default).
       </description>
+    </event>
+
+    <event name="will_stop">
+      <description summary="voice input is about to stop">
+        Sent when voice input is about to stop (user released the hotkey).
+        The client must respond with ack_stop to indicate whether to freeze
+        the orb or proceed with hiding.
+        
+        This allows the client to keep the orb visible if transcription is
+        still processing and a new window will open soon.
+        
+        The serial must be echoed back in the ack_stop request.
+      </description>
+      <arg name="serial" type="uint" summary="serial for ack_stop"/>
     </event>
   </interface>
 </protocol>

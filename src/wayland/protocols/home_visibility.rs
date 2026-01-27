@@ -8,7 +8,7 @@
 //!
 //! Layer surfaces can be:
 //! - "always visible" (default): Rendered regardless of home state (e.g., top panel, dock)
-//! - "home only": Only rendered when in home mode (e.g., humainos-home desktop)
+//! - "home only": Only rendered when in home mode
 
 pub use generated::{zcosmic_home_visibility_manager_v1, zcosmic_home_visibility_v1};
 
