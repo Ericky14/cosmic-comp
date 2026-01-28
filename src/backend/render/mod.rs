@@ -1226,16 +1226,12 @@ where
             .unwrap_or_default()
     };
 
-    // Extract voice orb state BEFORE dropping shell lock
-    // (but after extracting embedded_children_for_grabbed)
-    let grabbed_orb_state: Option<voice_orb::VoiceOrbState> = {
-        let shell_guard = shell.read();
-        if shell_guard.voice_orb_state.should_render_at_window_level() {
-            Some(shell_guard.voice_orb_state.clone())
+    let grabbed_orb_state: Option<voice_orb::VoiceOrbState> =
+        if shell_ref.voice_orb_state.should_render_at_window_level() {
+            Some(shell_ref.voice_orb_state.clone())
         } else {
             None
-        }
-    };
+        };
 
     // we don't want to hold a shell lock across `cursor_elements`,
     // that is prone to deadlock with the main-thread on some grabs.
